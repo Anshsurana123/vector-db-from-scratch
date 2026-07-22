@@ -1,7 +1,6 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
 use rand::Rng;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::distance::MetricType;
@@ -359,11 +358,11 @@ impl HnswIndex {
                 None => continue,
             };
 
-            // Rayon parallel evaluation of diversity condition across threads
+            // Fast L1-cache sequential evaluation of diversity condition
             let metric = self.metric;
             let e_dist = e.distance;
             let is_closer = result_vectors
-                .par_iter()
+                .iter()
                 .all(|&r_vec| compute_distance(metric, e_vec, r_vec) > e_dist);
 
             if is_closer {
