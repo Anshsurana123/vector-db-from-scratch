@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db = VectorDb::new();
-    let config = HnswConfig::new(12, 40, 100);
+    let config = HnswConfig::new(16, 80, 100);
 
     let start_index = Instant::now();
     let collection = db.create_collection_with_config("bench_col", dim, MetricType::L2, config)?;
