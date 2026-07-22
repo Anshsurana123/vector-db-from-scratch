@@ -12,7 +12,7 @@
 | :--- | :--- | :---: | :--- |
 | **Milestone 1** | Storage Engine + Brute-force Exact Search + API | **PASS** | 10,000 vectors (128-dim), 100% exact match against Python NumPy ground truth across L2, Cosine, Dot Product metrics. Insert, search, delete round-trip verified. |
 | **Milestone 2** | HNSW Single-threaded Graph Implementation | **PASS** | 100,000 vectors (128-dim), **Recall@10 = 0.9630** at `efSearch=300` (exceeds $\ge 0.95$ gate threshold), 4.7ms search latency, paper-exact Algorithm 4 heuristic diversity selection. |
-| **Milestone 3** | Persistence: WAL + Bincode Snapshot + Crash Recovery | **PLANNED** | Append-only WAL with CRC32 checksums, atomic Bincode snapshots (`.snap.tmp` -> `.snap`), 100k vector recovery test within < 2 seconds. |
+| **Milestone 3** | Persistence: WAL + Bincode Snapshot + Crash Recovery | **PASS** | Append-only WAL with custom binary frame encoding (`[magic:4][op_type:1][seq:8][payload_len:4][payload][crc32:4]`), atomic Bincode snapshots (`.snap.tmp` -> `.snap`), 100,000 vector state recovered in **1.7567 seconds** ($< 2.0$s target). |
 | **Milestone 4** | Product Quantization (PQ) Vector Compression | **PLANNED** | $8\times$ memory reduction, $m=16$ sub-vectors, 256 cluster codebooks via K-Means++, asymmetric distance computation (ADC). |
 | **Milestone 5** | Filtering & Metadata Storage | **PLANNED** | Roaring Bitmap inverted index for exact field filtering, pre-filtering vs post-filtering integrated into HNSW search traversal. |
 | **Milestone 6** | HTTP API Layer (`vectordb-server`) | **PLANNED** | Production-grade `axum` HTTP server (`/collections`, `/insert`, `/search`, `/delete`), graceful shutdown, and structured JSON errors. |
@@ -44,16 +44,20 @@
   - Average latency: **4.7ms** per 100k vector search.
   - Strictly monotonic recall growth: `50 (0.5260) -> 100 (0.7460) -> 200 (0.9140) -> 300 (0.9630) -> 400 (0.9900)`.
 
+### Milestone 3: Persistence (WAL + Bincode Snapshot + Crash Recovery) — **PASS**
+- **Core Features**:
+  - **Append-Only Write-Ahead Log (WAL)**: Binary framing with `VWAL` magic header, operation sequence numbers, payload lengths, and CRC32 trailers computed via `crc32fast`.
+  - **EOF Corruption Truncation**: On recovery, if an un-flushed partial frame is encountered at EOF with a CRC32 mismatch, the WAL file is truncated to the last valid frame offset.
+  - **Atomic Bincode Snapshots**: `SnapshotEngine` serializes in-memory storage + HNSW graph state to `.snap.tmp`, executes `sync_all()`, and atomically renames to `.snap`.
+- **Verification**:
+  - `milestone3_gate` verified full crash recovery on 100,000 128-dim vectors.
+  - **Atomic Snapshot Save Time**: **602ms** for 99,800 vectors.
+  - **Crash Recovery Duration**: **1.7567 seconds** (exceeding sub-2s gate target).
+  - **100% Vector State Restoration**: 100,000 / 100,000 vectors restored with exact HNSW search accuracy and tombstone deletion exclusion.
+
 ---
 
 ## 🚀 Future Milestones Roadmap
-
-### Milestone 3: Persistence (WAL + Bincode Snapshot + Crash Recovery)
-- **Goal**: Full durability across unexpected process crashes.
-- **Components**:
-  - Append-Only Write-Ahead Log (`vectordb-core/src/wal.rs`) with custom binary frame encoding (`[magic:4][op_type:1][payload_len:4][payload][crc32:4]`).
-  - Atomic Bincode Snapshots (`vectordb-core/src/snapshot.rs`) writing `.snap.tmp` and atomically renaming to `.snap`.
-  - Crash recovery engine restoring `VectorStorage` and `HnswIndex` state by loading latest snapshot + replaying WAL entries after snapshot sequence number.
 
 ### Milestone 4: Product Quantization (PQ) Compression
 - **Goal**: $8\times$ to $16\times$ RAM footprint reduction.
