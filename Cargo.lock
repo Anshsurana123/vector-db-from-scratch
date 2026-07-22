@@ -1451,6 +1451,7 @@ name = "vectordb-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",
