@@ -1,5 +1,7 @@
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use parking_lot::Mutex;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -220,7 +222,7 @@ pub struct HnswNode {
     pub neighbors: Vec<Vec<usize>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HnswIndex {
     pub config: HnswConfig,
     pub metric: MetricType,
@@ -228,6 +230,26 @@ pub struct HnswIndex {
     pub id_to_node_idx: std::collections::HashMap<u64, usize>,
     pub entry_point: Option<usize>,
     pub max_layer: usize,
+
+    #[serde(skip)]
+    visited_tags: Mutex<Vec<u32>>,
+    #[serde(skip)]
+    visit_id_counter: AtomicU32,
+}
+
+impl Clone for HnswIndex {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            metric: self.metric,
+            nodes: self.nodes.clone(),
+            id_to_node_idx: self.id_to_node_idx.clone(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+            visited_tags: Mutex::new(Vec::new()),
+            visit_id_counter: AtomicU32::new(1),
+        }
+    }
 }
 
 impl HnswIndex {
@@ -239,6 +261,8 @@ impl HnswIndex {
             id_to_node_idx: std::collections::HashMap::new(),
             entry_point: None,
             max_layer: 0,
+            visited_tags: Mutex::new(Vec::new()),
+            visit_id_counter: AtomicU32::new(1),
         }
     }
 
@@ -257,13 +281,30 @@ impl HnswIndex {
         ef: usize,
         lc: usize,
         storage: &VectorStorage,
-    ) -> (BinaryHeap<MaxCandidate>, HashSet<usize>) {
-        let mut visited = HashSet::new();
+    ) -> (BinaryHeap<MaxCandidate>, usize) {
+        let mut visit_id = self.visit_id_counter.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut visited = self.visited_tags.lock();
+        
+        let num_nodes = self.nodes.len();
+        if visited.len() < num_nodes {
+            visited.resize(num_nodes + 1024, 0);
+        }
+
+        if visit_id == u32::MAX {
+            for tag in visited.iter_mut() {
+                *tag = 0;
+            }
+            self.visit_id_counter.store(1, AtomicOrdering::Relaxed);
+            visit_id = 1;
+        }
+
         let mut min_candidates = BinaryHeap::new();
         let mut max_results = BinaryHeap::new();
 
         for &node_idx in ep {
-            visited.insert(node_idx);
+            if node_idx < visited.len() {
+                visited[node_idx] = visit_id;
+            }
             if let Some(vec) = storage.get_vector_by_idx(node_idx) {
                 let dist = compute_distance(self.metric, query, vec);
                 let cand = Candidate { idx: node_idx, distance: dist };
@@ -281,7 +322,9 @@ impl HnswIndex {
             let node = &self.nodes[curr.idx];
             if lc < node.neighbors.len() {
                 for &nbr_idx in &node.neighbors[lc] {
-                    if visited.insert(nbr_idx) {
+                    if nbr_idx < visited.len() && visited[nbr_idx] != visit_id {
+                        visited[nbr_idx] = visit_id;
+
                         if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_idx) {
                             let dist = compute_distance(self.metric, query, nbr_vec);
                             let cand = Candidate { idx: nbr_idx, distance: dist };
@@ -301,11 +344,7 @@ impl HnswIndex {
             }
         }
 
-        (max_results, visited)
-    }
-
-    fn get_nearest_candidate(heap: &BinaryHeap<MaxCandidate>) -> Option<Candidate> {
-        heap.iter().min_by(|a, b| a.0.distance.partial_cmp(&b.0.distance).unwrap_or(Ordering::Equal)).map(|m| m.0)
+        (max_results, ep.len())
     }
 
     /// Algorithm 4: Heuristic Neighbor Selection (Malikov & Yashunin)
@@ -321,7 +360,7 @@ impl HnswIndex {
         w_candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
 
         if self.config.extend_candidates {
-            let mut extended = HashSet::new();
+            let mut extended = std::collections::HashSet::new();
             for cand in &w_candidates {
                 extended.insert(cand.idx);
                 let node = &self.nodes[cand.idx];
