@@ -358,7 +358,6 @@ impl HnswIndex {
                 None => continue,
             };
 
-            // Fast L1-cache sequential evaluation of diversity condition
             let metric = self.metric;
             let e_dist = e.distance;
             let is_closer = result_vectors
@@ -408,7 +407,7 @@ impl HnswIndex {
         self.nodes.push(new_node);
         self.id_to_node_idx.insert(id, q_node_idx);
 
-        let mut curr_ep = match self.entry_point {
+        let curr_ep = match self.entry_point {
             None => {
                 self.entry_point = Some(q_node_idx);
                 self.max_layer = target_level;
@@ -420,12 +419,12 @@ impl HnswIndex {
         let mut ep_vec = vec![curr_ep];
         let max_l = self.max_layer;
 
-        // 1. Top layer down to target_level + 1: Greedy Search (ef=1)
+        // 1. Top layer down to target_level + 1: Traverse with candidate beam ef=4
         for lc in (target_level + 1..=max_l).rev() {
-            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 1, lc, storage);
-            if let Some(best) = Self::get_nearest_candidate(&candidates) {
-                curr_ep = best.idx;
-                ep_vec = vec![curr_ep];
+            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 4, lc, storage);
+            let top_cands: Vec<usize> = candidates.into_vec().into_iter().map(|m| m.0.idx).collect();
+            if !top_cands.is_empty() {
+                ep_vec = top_cands;
             }
         }
 
@@ -509,18 +508,20 @@ impl HnswIndex {
 
         let ef = std::cmp::max(ef_search, k);
 
-        let mut curr_ep = match self.entry_point {
+        let curr_ep = match self.entry_point {
             Some(ep) => ep,
             None => return Ok(Vec::new()),
         };
 
         let mut ep_vec = vec![curr_ep];
 
+        // Traverse upper layers with small beam ef_upper to prevent local minima traps
+        let ef_upper = std::cmp::min(ef, 8);
         for lc in (1..=self.max_layer).rev() {
-            let (candidates, _) = self.search_layer(query, &ep_vec, 1, lc, storage);
-            if let Some(best) = Self::get_nearest_candidate(&candidates) {
-                curr_ep = best.idx;
-                ep_vec = vec![curr_ep];
+            let (candidates, _) = self.search_layer(query, &ep_vec, ef_upper, lc, storage);
+            let top_cands: Vec<usize> = candidates.into_vec().into_iter().map(|m| m.0.idx).collect();
+            if !top_cands.is_empty() {
+                ep_vec = top_cands;
             }
         }
 

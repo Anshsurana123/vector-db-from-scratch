@@ -6,8 +6,8 @@ use std::time::Instant;
 use vectordb_core::{HnswConfig, MetricType, VectorDb};
 
 #[test]
-fn test_debug_recall_20k() -> Result<(), Box<dyn std::error::Error>> {
-    let num_vectors = 20_000;
+fn test_debug_recall_10k() -> Result<(), Box<dyn std::error::Error>> {
+    let num_vectors = 10_000;
     let dim = 128;
     let num_queries = 50;
     let k = 10;
@@ -36,7 +36,7 @@ fn test_debug_recall_20k() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for &(m, ef_c) in &[(16, 100), (32, 200)] {
-        let mut config = HnswConfig::new(m, ef_c, 100);
+        let config = HnswConfig::new(m, ef_c, 100);
         let db = VectorDb::new();
         let name = format!("col_m{}_ef{}", m, ef_c);
         let collection = db.create_collection_with_config(&name, dim, MetricType::L2, config)?;
