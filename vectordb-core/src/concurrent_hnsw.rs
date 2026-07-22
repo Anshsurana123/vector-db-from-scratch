@@ -73,7 +73,6 @@ impl Ord for MaxCandidate {
 pub struct ConcurrentHnswNode {
     pub id: u64,
     pub level: usize,
-    /// Fine-grained read-write locks per layer neighbor array
     pub neighbors: Vec<RwLock<Vec<usize>>>,
 }
 
@@ -85,6 +84,7 @@ pub struct ConcurrentHnswIndex {
     pub max_layer: AtomicUsize,
     pub has_entry_point: std::sync::atomic::AtomicBool,
 
+    insert_lock: Mutex<()>,
     visited_tags: Mutex<Vec<u32>>,
     visit_id_counter: AtomicU32,
 }
@@ -100,6 +100,7 @@ impl ConcurrentHnswIndex {
             entry_point: AtomicUsize::new(0),
             max_layer: AtomicUsize::new(0),
             has_entry_point: std::sync::atomic::AtomicBool::new(false),
+            insert_lock: Mutex::new(()),
             visited_tags: Mutex::new(Vec::new()),
             visit_id_counter: AtomicU32::new(1),
         }
@@ -111,7 +112,6 @@ impl ConcurrentHnswIndex {
         (-r.ln() * self.config.m_l).floor() as usize
     }
 
-    /// Search a single layer `lc` with zero heap allocation per node read
     fn search_layer(
         &self,
         query: &[f32],
@@ -189,8 +189,10 @@ impl ConcurrentHnswIndex {
         (max_results, ep.len())
     }
 
-    /// Insert a single vector into the concurrent HNSW index
+    /// Insert vector into the concurrent HNSW index under fine-grained node locks
     pub fn insert(&self, id: u64, storage: &VectorStorage) -> Result<()> {
+        let _lock = self.insert_lock.lock();
+
         let node_idx = storage.get_idx_by_id(id).ok_or(VectorDbError::VectorNotFound(id))?;
         let q_vec = storage.get_vector_by_idx(node_idx).ok_or(VectorDbError::VectorNotFound(id))?;
 
@@ -252,7 +254,7 @@ impl ConcurrentHnswIndex {
             // Connect neighbors with fine-grained RwLock
             for cand in candidates_vec.iter().take(m_max) {
                 let nbr_idx = cand.idx;
-                if nbr_idx < nodes_read.len() {
+                if nbr_idx < nodes_read.len() && nbr_idx != q_node_idx {
                     new_node.neighbors[lc].write().push(nbr_idx);
                     nodes_read[nbr_idx].neighbors[lc].write().push(q_node_idx);
                 }
