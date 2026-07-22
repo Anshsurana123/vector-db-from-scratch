@@ -1,11 +1,116 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::distance::{DistanceMetric, MetricType, get_distance_metric};
+use crate::distance::MetricType;
 use crate::error::{Result, VectorDbError};
 use crate::storage::{SearchResult, VectorStorage};
+
+#[inline(always)]
+pub fn compute_distance(metric: MetricType, a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    match metric {
+        MetricType::L2 => {
+            let mut sum0 = 0.0f32;
+            let mut sum1 = 0.0f32;
+            let mut sum2 = 0.0f32;
+            let mut sum3 = 0.0f32;
+
+            let chunks_a = a.chunks_exact(4);
+            let chunks_b = b.chunks_exact(4);
+            let rem_a = chunks_a.remainder();
+            let rem_b = chunks_b.remainder();
+
+            for (ca, cb) in chunks_a.zip(chunks_b) {
+                let d0 = ca[0] - cb[0];
+                let d1 = ca[1] - cb[1];
+                let d2 = ca[2] - cb[2];
+                let d3 = ca[3] - cb[3];
+                sum0 += d0 * d0;
+                sum1 += d1 * d1;
+                sum2 += d2 * d2;
+                sum3 += d3 * d3;
+            }
+
+            let mut sum = sum0 + sum1 + sum2 + sum3;
+            for (&x, &y) in rem_a.iter().zip(rem_b) {
+                let diff = x - y;
+                sum += diff * diff;
+            }
+            sum
+        }
+        MetricType::Cosine => {
+            let mut dot0 = 0.0f32;
+            let mut dot1 = 0.0f32;
+            let mut na0 = 0.0f32;
+            let mut na1 = 0.0f32;
+            let mut nb0 = 0.0f32;
+            let mut nb1 = 0.0f32;
+
+            let chunks_a = a.chunks_exact(2);
+            let chunks_b = b.chunks_exact(2);
+            let rem_a = chunks_a.remainder();
+            let rem_b = chunks_b.remainder();
+
+            for (ca, cb) in chunks_a.zip(chunks_b) {
+                let x0 = ca[0];
+                let x1 = ca[1];
+                let y0 = cb[0];
+                let y1 = cb[1];
+
+                dot0 += x0 * y0;
+                dot1 += x1 * y1;
+                na0 += x0 * x0;
+                na1 += x1 * x1;
+                nb0 += y0 * y0;
+                nb1 += y1 * y1;
+            }
+
+            let mut dot = dot0 + dot1;
+            let mut norm_a = na0 + na1;
+            let mut norm_b = nb0 + nb1;
+
+            for (&x, &y) in rem_a.iter().zip(rem_b) {
+                dot += x * y;
+                norm_a += x * x;
+                norm_b += y * y;
+            }
+
+            let norm = (norm_a * norm_b).sqrt();
+            if norm < 1e-10 {
+                1.0
+            } else {
+                1.0 - (dot / norm)
+            }
+        }
+        MetricType::DotProduct => {
+            let mut sum0 = 0.0f32;
+            let mut sum1 = 0.0f32;
+            let mut sum2 = 0.0f32;
+            let mut sum3 = 0.0f32;
+
+            let chunks_a = a.chunks_exact(4);
+            let chunks_b = b.chunks_exact(4);
+            let rem_a = chunks_a.remainder();
+            let rem_b = chunks_b.remainder();
+
+            for (ca, cb) in chunks_a.zip(chunks_b) {
+                sum0 += ca[0] * cb[0];
+                sum1 += ca[1] * cb[1];
+                sum2 += ca[2] * cb[2];
+                sum3 += ca[3] * cb[3];
+            }
+
+            let mut dot = sum0 + sum1 + sum2 + sum3;
+            for (&x, &y) in rem_a.iter().zip(rem_b) {
+                dot += x * y;
+            }
+            -dot
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswConfig {
@@ -63,7 +168,6 @@ impl PartialEq for Candidate {
 
 impl Eq for Candidate {}
 
-// Min-heap ordering by distance (smaller distance has higher priority)
 #[derive(Debug, Clone, Copy)]
 struct MinCandidate(Candidate);
 
@@ -83,12 +187,10 @@ impl PartialOrd for MinCandidate {
 
 impl Ord for MinCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse order so min distance is popped first
         other.0.distance.partial_cmp(&self.0.distance).unwrap_or(Ordering::Equal)
     }
 }
 
-// Max-heap ordering by distance (larger distance has higher priority)
 #[derive(Debug, Clone, Copy)]
 struct MaxCandidate(Candidate);
 
@@ -148,6 +250,7 @@ impl HnswIndex {
     }
 
     /// Search a single layer `lc` starting from `ep` entry points with candidate limit `ef`
+    #[inline]
     fn search_layer(
         &self,
         query: &[f32],
@@ -155,7 +258,6 @@ impl HnswIndex {
         ef: usize,
         lc: usize,
         storage: &VectorStorage,
-        dist_fn: &dyn DistanceMetric,
     ) -> (BinaryHeap<MaxCandidate>, HashSet<usize>) {
         let mut visited = HashSet::new();
         let mut min_candidates = BinaryHeap::new();
@@ -164,7 +266,7 @@ impl HnswIndex {
         for &node_idx in ep {
             visited.insert(node_idx);
             if let Some(vec) = storage.get_vector_by_idx(node_idx) {
-                let dist = dist_fn.distance(query, vec);
+                let dist = compute_distance(self.metric, query, vec);
                 let cand = Candidate { idx: node_idx, distance: dist };
                 min_candidates.push(MinCandidate(cand));
                 max_results.push(MaxCandidate(cand));
@@ -182,7 +284,7 @@ impl HnswIndex {
                 for &nbr_idx in &node.neighbors[lc] {
                     if visited.insert(nbr_idx) {
                         if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_idx) {
-                            let dist = dist_fn.distance(query, nbr_vec);
+                            let dist = compute_distance(self.metric, query, nbr_vec);
                             let cand = Candidate { idx: nbr_idx, distance: dist };
                             let worst_dist = max_results.peek().map(|m| m.0.distance).unwrap_or(f32::MAX);
 
@@ -203,8 +305,11 @@ impl HnswIndex {
         (max_results, visited)
     }
 
+    fn get_nearest_candidate(heap: &BinaryHeap<MaxCandidate>) -> Option<Candidate> {
+        heap.iter().min_by(|a, b| a.0.distance.partial_cmp(&b.0.distance).unwrap_or(Ordering::Equal)).map(|m| m.0)
+    }
+
     /// Algorithm 4: Heuristic Neighbor Selection (Malikov & Yashunin)
-    /// Prefers spatial diversity over pure closest-M.
     fn select_neighbors_heuristic(
         &self,
         query: &[f32],
@@ -212,15 +317,10 @@ impl HnswIndex {
         m: usize,
         lc: usize,
         storage: &VectorStorage,
-        dist_fn: &dyn DistanceMetric,
     ) -> Vec<usize> {
-        let mut result_indices = Vec::with_capacity(m);
         let mut w_candidates = candidates;
-
-        // Sort candidates by distance to query ascending
         w_candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
 
-        // Optionally extend candidates with their neighbors at level lc
         if self.config.extend_candidates {
             let mut extended = HashSet::new();
             for cand in &w_candidates {
@@ -238,13 +338,15 @@ impl HnswIndex {
                 .filter_map(|idx| {
                     storage.get_vector_by_idx(idx).map(|v| Candidate {
                         idx,
-                        distance: dist_fn.distance(query, v),
+                        distance: compute_distance(self.metric, query, v),
                     })
                 })
                 .collect();
             w_candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
         }
 
+        let mut result_indices: Vec<usize> = Vec::with_capacity(m);
+        let mut result_vectors: Vec<&[f32]> = Vec::with_capacity(m);
         let mut discarded = Vec::new();
 
         for e in w_candidates {
@@ -257,27 +359,21 @@ impl HnswIndex {
                 None => continue,
             };
 
-            // Heuristic Diversity Check:
-            // Candidate e is added to R if e is closer to query q than to any already-selected neighbor r in R.
-            let mut is_closer = true;
-            for &r_idx in &result_indices {
-                if let Some(r_vec) = storage.get_vector_by_idx(r_idx) {
-                    let dist_e_r = dist_fn.distance(e_vec, r_vec);
-                    if dist_e_r <= e.distance {
-                        is_closer = false;
-                        break;
-                    }
-                }
-            }
+            // Rayon parallel evaluation of diversity condition across threads
+            let metric = self.metric;
+            let e_dist = e.distance;
+            let is_closer = result_vectors
+                .par_iter()
+                .all(|&r_vec| compute_distance(metric, e_vec, r_vec) > e_dist);
 
             if is_closer {
                 result_indices.push(e.idx);
+                result_vectors.push(e_vec);
             } else {
                 discarded.push(e.idx);
             }
         }
 
-        // If keep_pruned_connections is set and we have remaining slots, fill from discarded candidates
         if self.config.keep_pruned_connections && result_indices.len() < m {
             for idx in discarded {
                 if result_indices.len() >= m {
@@ -296,7 +392,6 @@ impl HnswIndex {
     pub fn insert(&mut self, id: u64, storage: &VectorStorage) -> Result<()> {
         let node_idx = storage.get_idx_by_id(id).ok_or(VectorDbError::VectorNotFound(id))?;
         let q_vec = storage.get_vector_by_idx(node_idx).ok_or(VectorDbError::VectorNotFound(id))?;
-        let dist_fn = get_distance_metric(self.metric);
 
         let target_level = self.random_level();
         let mut neighbors = Vec::with_capacity(target_level + 1);
@@ -328,9 +423,9 @@ impl HnswIndex {
 
         // 1. Top layer down to target_level + 1: Greedy Search (ef=1)
         for lc in (target_level + 1..=max_l).rev() {
-            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 1, lc, storage, dist_fn.as_ref());
-            if let Some(best) = candidates.peek() {
-                curr_ep = best.0.idx;
+            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 1, lc, storage);
+            if let Some(best) = Self::get_nearest_candidate(&candidates) {
+                curr_ep = best.idx;
                 ep_vec = vec![curr_ep];
             }
         }
@@ -344,28 +439,23 @@ impl HnswIndex {
                 self.config.ef_construction,
                 lc,
                 storage,
-                dist_fn.as_ref(),
             );
 
             let candidates_vec: Vec<Candidate> = candidates_heap.into_vec().into_iter().map(|m| m.0).collect();
-
             let m_max = if lc == 0 { self.config.m_max0 } else { self.config.m };
 
             let selected_nbrs = self.select_neighbors_heuristic(
                 q_vec,
-                candidates_vec,
+                candidates_vec.clone(),
                 m_max,
                 lc,
                 storage,
-                dist_fn.as_ref(),
             );
 
-            // Connect bidirectional edges
             for &nbr_idx in &selected_nbrs {
                 self.nodes[q_node_idx].neighbors[lc].push(nbr_idx);
                 self.nodes[nbr_idx].neighbors[lc].push(q_node_idx);
 
-                // Prune neighbor's edge list if it exceeds m_max using Heuristic
                 if self.nodes[nbr_idx].neighbors[lc].len() > m_max {
                     let nbr_vec = match storage.get_vector_by_idx(nbr_idx) {
                         Some(v) => v,
@@ -377,7 +467,7 @@ impl HnswIndex {
                         .filter_map(|&c_idx| {
                             storage.get_vector_by_idx(c_idx).map(|v| Candidate {
                                 idx: c_idx,
-                                distance: dist_fn.distance(nbr_vec, v),
+                                distance: compute_distance(self.metric, nbr_vec, v),
                             })
                         })
                         .collect();
@@ -388,17 +478,16 @@ impl HnswIndex {
                         m_max,
                         lc,
                         storage,
-                        dist_fn.as_ref(),
                     );
 
                     self.nodes[nbr_idx].neighbors[lc] = pruned;
                 }
             }
 
-            ep_vec = selected_nbrs;
+            // Paper Algorithm 1 Line 14: ep = W (all candidates found at layer lc)
+            ep_vec = candidates_vec.iter().map(|c| c.idx).collect();
         }
 
-        // Update entry point if target level exceeds current max layer
         if target_level > self.max_layer {
             self.max_layer = target_level;
             self.entry_point = Some(q_node_idx);
@@ -419,7 +508,6 @@ impl HnswIndex {
             return Ok(Vec::new());
         }
 
-        let dist_fn = get_distance_metric(self.metric);
         let ef = std::cmp::max(ef_search, k);
 
         let mut curr_ep = match self.entry_point {
@@ -429,17 +517,15 @@ impl HnswIndex {
 
         let mut ep_vec = vec![curr_ep];
 
-        // Greedy search top layer down to 1
         for lc in (1..=self.max_layer).rev() {
-            let (candidates, _) = self.search_layer(query, &ep_vec, 1, lc, storage, dist_fn.as_ref());
-            if let Some(best) = candidates.peek() {
-                curr_ep = best.0.idx;
+            let (candidates, _) = self.search_layer(query, &ep_vec, 1, lc, storage);
+            if let Some(best) = Self::get_nearest_candidate(&candidates) {
+                curr_ep = best.idx;
                 ep_vec = vec![curr_ep];
             }
         }
 
-        // Layer 0 search with ef_search
-        let (candidates_heap, _) = self.search_layer(query, &ep_vec, ef, 0, storage, dist_fn.as_ref());
+        let (candidates_heap, _) = self.search_layer(query, &ep_vec, ef, 0, storage);
 
         let mut sorted_cands: Vec<Candidate> = candidates_heap
             .into_vec()
@@ -485,7 +571,6 @@ mod tests {
         let config = HnswConfig::new(8, 32, 32);
         let mut index = HnswIndex::new(config, MetricType::L2);
 
-        // Insert 100 2D points
         for i in 0..100 {
             let id = i as u64;
             let vec = vec![i as f32, (i * 2) as f32];
@@ -495,7 +580,6 @@ mod tests {
 
         assert_eq!(index.len(), 100);
 
-        // Search near point (5.0, 10.0) -> ID 5
         let results = index.search(&[5.1, 10.1], 5, 32, &storage)?;
         assert!(!results.is_empty());
         assert_eq!(results[0].id, 5);

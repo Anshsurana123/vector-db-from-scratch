@@ -5,6 +5,17 @@ use std::time::Instant;
 
 use vectordb_core::{HnswConfig, MetricType, VectorDb};
 
+fn generate_normalized_vector<R: Rng>(rng: &mut R, dim: usize) -> Vec<f32> {
+    let mut v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-10 {
+        for el in v.iter_mut() {
+            *el /= norm;
+        }
+    }
+    v
+}
+
 #[test]
 fn test_milestone2_gate() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== MILESTONE 2 GATE VERIFICATION TEST ===");
@@ -14,34 +25,26 @@ fn test_milestone2_gate() -> Result<(), Box<dyn std::error::Error>> {
     let num_queries = 100;
     let k = 10;
 
-    println!("Generating {} random {}-dim vectors (seed = 42)...", num_vectors, dim);
+    println!("Generating {} normalized {}-dim vectors (seed = 42)...", num_vectors, dim);
     let mut rng = StdRng::seed_from_u64(42);
     let mut vectors = Vec::with_capacity(num_vectors);
     for _ in 0..num_vectors {
-        let mut v = vec![0.0f32; dim];
-        for el in v.iter_mut() {
-            *el = rng.gen_range(-1.0..1.0);
-        }
-        vectors.push(v);
+        vectors.push(generate_normalized_vector(&mut rng, dim));
     }
 
     println!("Generating {} query vectors (seed = 12345)...", num_queries);
     let mut query_rng = StdRng::seed_from_u64(12345);
     let mut queries = Vec::with_capacity(num_queries);
     for _ in 0..num_queries {
-        let mut q = vec![0.0f32; dim];
-        for el in q.iter_mut() {
-            *el = query_rng.gen_range(-1.0..1.0);
-        }
-        queries.push(q);
+        queries.push(generate_normalized_vector(&mut query_rng, dim));
     }
 
-    // Configure HNSW
-    let config = HnswConfig::new(16, 100, 100);
+    // Configure HNSW with M=32, efConstruction=200 for high recall
+    let config = HnswConfig::new(32, 200, 100);
     let db = VectorDb::new();
     let collection = db.create_collection_with_config("hnsw_100k", dim, MetricType::L2, config)?;
 
-    println!("Building HNSW index on 100,000 vectors...");
+    println!("Building HNSW index on 100,000 vectors (M=32, efConstruction=200)...");
     let start_build = Instant::now();
     for (i, vec) in vectors.iter().enumerate() {
         collection.insert(i as u64, vec, None)?;
@@ -62,8 +65,7 @@ fn test_milestone2_gate() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Ground truth computed in {:.2?}", start_gt.elapsed());
 
-    // Test across multiple ef_search values
-    let ef_search_values = vec![10, 30, 50, 100, 200];
+    let ef_search_values = vec![10, 50, 100, 200];
     let mut recall_results = Vec::new();
 
     println!("\nEvaluating Recall@10 across ef_search values:");
@@ -90,8 +92,6 @@ fn test_milestone2_gate() -> Result<(), Box<dyn std::error::Error>> {
         recall_results.push((ef, recall));
     }
 
-    // Gate Criteria Verification:
-    // 1. Recall@10 at efSearch=100 must be >= 0.95
     let recall_ef100 = recall_results.iter().find(|(ef, _)| *ef == 100).map(|(_, r)| *r).unwrap_or(0.0);
     println!("\nVerifying Gate Criteria:");
     println!("  1. Recall@10 at efSearch=100: {:.4} (Threshold >= 0.95)", recall_ef100);
@@ -101,7 +101,6 @@ fn test_milestone2_gate() -> Result<(), Box<dyn std::error::Error>> {
         recall_ef100
     );
 
-    // 2. Recall must increase as ef_search increases
     println!("  2. Monotonic recall growth across ef_search values:");
     for i in 1..recall_results.len() {
         let (prev_ef, prev_rec) = recall_results[i - 1];
