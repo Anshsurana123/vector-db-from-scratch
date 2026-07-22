@@ -6,8 +6,8 @@ use std::time::Instant;
 use vectordb_core::{HnswConfig, MetricType, VectorDb};
 
 #[test]
-fn test_debug_recall_10k() -> Result<(), Box<dyn std::error::Error>> {
-    let num_vectors = 10_000;
+fn test_debug_recall_50k() -> Result<(), Box<dyn std::error::Error>> {
+    let num_vectors = 50_000;
     let dim = 128;
     let num_queries = 50;
     let k = 10;
@@ -35,7 +35,7 @@ fn test_debug_recall_10k() -> Result<(), Box<dyn std::error::Error>> {
         queries.push(q);
     }
 
-    for &(m, ef_c) in &[(16, 100), (32, 200)] {
+    for &(m, ef_c) in &[(16, 200), (32, 200), (48, 200)] {
         let config = HnswConfig::new(m, ef_c, 100);
         let db = VectorDb::new();
         let name = format!("col_m{}_ef{}", m, ef_c);
@@ -54,7 +54,7 @@ fn test_debug_recall_10k() -> Result<(), Box<dyn std::error::Error>> {
             ground_truths.push(ids);
         }
 
-        for &ef_s in &[10, 50, 100, 200] {
+        for &ef_s in &[100, 200, 300, 400] {
             let mut hits = 0;
             for (q_idx, q) in queries.iter().enumerate() {
                 let res = collection.search_hnsw(q, k, ef_s)?;
