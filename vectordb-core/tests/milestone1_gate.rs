@@ -96,8 +96,8 @@ fn test_milestone1_gate() -> Result<(), Box<dyn std::error::Error>> {
         let query = &dataset.queries[q_idx];
         let gt = gt_map.get(&q_idx.to_string()).ok_or("Spot check key not found in ground truth")?;
 
-        // 1. L2 Search
-        let res_l2 = col_l2.search(query, 10)?;
+        // 1. L2 Search (exact brute-force)
+        let res_l2 = col_l2.search_brute_force(query, 10)?;
         assert_eq!(res_l2.len(), 10);
         for k in 0..10 {
             let expected_id = gt.l2[k].id;
@@ -112,8 +112,8 @@ fn test_milestone1_gate() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        // 2. Cosine Search
-        let res_cosine = col_cosine.search(query, 10)?;
+        // 2. Cosine Search (exact brute-force)
+        let res_cosine = col_cosine.search_brute_force(query, 10)?;
         assert_eq!(res_cosine.len(), 10);
         for k in 0..10 {
             let expected_id = gt.cosine[k].id;
@@ -128,8 +128,8 @@ fn test_milestone1_gate() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        // 3. Dot Product Search
-        let res_dot = col_dot.search(query, 10)?;
+        // 3. Dot Product Search (exact brute-force)
+        let res_dot = col_dot.search_brute_force(query, 10)?;
         assert_eq!(res_dot.len(), 10);
         for k in 0..10 {
             let expected_id = gt.dot[k].id;
@@ -153,7 +153,7 @@ fn test_milestone1_gate() -> Result<(), Box<dyn std::error::Error>> {
     let target_vec = dataset.queries[0].clone();
 
     test_col.insert(target_id, &target_vec, Some(serde_json::json!({"test": "roundtrip"})))?;
-    let search_res1 = test_col.search(&target_vec, 1)?;
+    let search_res1 = test_col.search_brute_force(&target_vec, 1)?;
     assert_eq!(search_res1.len(), 1);
     assert_eq!(search_res1[0].id, target_id);
     assert_eq!(search_res1[0].distance, 0.0);
@@ -164,7 +164,7 @@ fn test_milestone1_gate() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(test_col.len(), 0);
 
     // Search again
-    let search_res2 = test_col.search(&target_vec, 1)?;
+    let search_res2 = test_col.search_brute_force(&target_vec, 1)?;
     assert_eq!(search_res2.len(), 0);
 
     println!("SUCCESS: API round-trip insert -> search -> delete -> search confirmed deleted vector is no longer returned.");
