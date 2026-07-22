@@ -1,9 +1,87 @@
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+use serde::Deserialize;
 
 use vectordb_core::{HnswConfig, MetricType, ProductQuantizer, QuantizedVectorStorage, VectorDb, VectorStorage};
+
+#[derive(Deserialize, Debug)]
+struct SearchMetrics {
+    recall: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    avg: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct FaissResults {
+    throughput: f64,
+    search: HashMap<String, SearchMetrics>,
+}
+
+fn download_sift1m_if_needed() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from("vectordb-bench/data/sift");
+    std::fs::create_dir_all(&data_dir)?;
+
+    let base_file1 = data_dir.join("sift_base.fvecs");
+    let base_file2 = data_dir.join("sift").join("sift_base.fvecs");
+
+    if base_file1.exists() {
+        return Ok(data_dir);
+    }
+    if base_file2.exists() {
+        return Ok(data_dir.join("sift"));
+    }
+
+    println!("  Executing SIFT1M dataset downloader...");
+    let _ = std::process::Command::new("python")
+        .args(&["vectordb-bench/download_sift1m.py"])
+        .status();
+
+    if data_dir.join("sift").join("sift_base.fvecs").exists() {
+        Ok(data_dir.join("sift"))
+    } else {
+        Ok(data_dir)
+    }
+}
+
+fn read_fvecs(path: &Path, max_count: Option<usize>) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut vectors = Vec::new();
+
+    loop {
+        if let Some(max) = max_count {
+            if vectors.len() >= max {
+                break;
+            }
+        }
+
+        let mut dim_buf = [0u8; 4];
+        if reader.read_exact(&mut dim_buf).is_err() {
+            break;
+        }
+        let dim = u32::from_le_bytes(dim_buf) as usize;
+
+        let mut vec_buf = vec![0.0f32; dim];
+        let mut byte_buf = vec![0u8; dim * 4];
+        reader.read_exact(&mut byte_buf)?;
+
+        for i in 0..dim {
+            let bytes = [byte_buf[i * 4], byte_buf[i * 4 + 1], byte_buf[i * 4 + 2], byte_buf[i * 4 + 3]];
+            vec_buf[i] = f32::from_le_bytes(bytes);
+        }
+
+        vectors.push(vec_buf);
+    }
+
+    Ok(vectors)
+}
 
 fn generate_normalized_vector<R: Rng>(rng: &mut R, dim: usize) -> Vec<f32> {
     let mut v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
@@ -21,18 +99,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("       PRODUCTION VECTOR DATABASE IN RUST — BENCHMARK SUITE");
     println!("=========================================================================");
 
-    let num_vectors = 10_000;
-    let dim = 128;
-    let num_queries = 1_000;
-    let k = 10;
-
-    println!("\n[1/4] Running Indexing Throughput Benchmark (10,000 128-dim vectors)...");
-    let mut rng = StdRng::seed_from_u64(42);
-    let mut vectors = Vec::with_capacity(num_vectors);
-    for _ in 0..num_vectors {
-        vectors.push(generate_normalized_vector(&mut rng, dim));
+    println!("  Executing FAISS comparison benchmark...");
+    let faiss_status = std::process::Command::new("python")
+        .args(&["vectordb-bench/compare_faiss.py"])
+        .status();
+    
+    let mut faiss_results: Option<FaissResults> = None;
+    if let Ok(status) = faiss_status {
+        if status.success() {
+            if let Ok(json_str) = std::fs::read_to_string("vectordb-bench/faiss_results.json") {
+                faiss_results = serde_json::from_str(&json_str).ok();
+            }
+        }
     }
 
+    let data_dir = download_sift1m_if_needed().unwrap_or_else(|_| PathBuf::from("vectordb-bench/data/sift"));
+    let base_fvecs = data_dir.join("sift_base.fvecs");
+    let query_fvecs = data_dir.join("sift_query.fvecs");
+
+    let (vectors, queries) = if base_fvecs.exists() && query_fvecs.exists() {
+        println!("  Loading real SIFT1M dataset files...");
+        let vecs = read_fvecs(&base_fvecs, Some(10_000))?;
+        let q = read_fvecs(&query_fvecs, Some(1_000))?;
+        (vecs, q)
+    } else {
+        println!("  Using synthetic normalized vectors for benchmark fallback...");
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut vecs = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            vecs.push(generate_normalized_vector(&mut rng, 128));
+        }
+        let mut query_rng = StdRng::seed_from_u64(12345);
+        let mut q = Vec::with_capacity(1_000);
+        for _ in 0..1_000 {
+            q.push(generate_normalized_vector(&mut query_rng, 128));
+        }
+        (vecs, q)
+    };
+
+    let num_vectors = vectors.len();
+    let dim = vectors[0].len();
+    let num_queries = queries.len();
+    let k = 10;
+
+    println!("\n[1/4] Running Indexing Throughput Benchmark ({} {}-dim vectors)...", num_vectors, dim);
     let db = VectorDb::new();
     let config = HnswConfig::new(16, 80, 100);
 
@@ -49,14 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Total Indexing Duration: {:.2?}", index_duration);
     println!("  Indexing Throughput: {:.2} vectors / sec", indexing_throughput);
 
-    println!("\n[2/4] Generating {} Query Vectors & Ground Truth...", num_queries);
-    let mut query_rng = StdRng::seed_from_u64(12345);
-    let mut queries = Vec::with_capacity(num_queries);
-    for _ in 0..num_queries {
-        queries.push(generate_normalized_vector(&mut query_rng, dim));
-    }
-
-    // Compute ground truth for a sample of 100 queries
+    println!("\n[2/4] Computing Ground Truth Nearest Neighbors...");
     let sample_queries = 100;
     let mut raw_storage = VectorStorage::new(dim);
     for (i, vec) in vectors.iter().enumerate() {
@@ -73,9 +176,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[3/4] Running Search Latency Distribution & Recall Curve Benchmarks...");
     let ef_values = vec![10, 50, 100, 200, 300];
 
-    println!("\n+-----------+--------------+--------------+--------------+--------------+-------------+");
-    println!("| efSearch  | Recall@10    | p50 Latency  | p95 Latency  | p99 Latency  | Avg Latency |");
-    println!("+-----------+--------------+--------------+--------------+--------------+-------------+");
+    if let Some(faiss) = &faiss_results {
+        println!("\n================== RUST VECTORDB VS FAISS HNSW ==================");
+        println!("Indexing Throughput:");
+        println!("  Rust VectorDB: {:.2} vectors/sec", indexing_throughput);
+        println!("  FAISS HNSW:    {:.2} vectors/sec", faiss.throughput);
+        println!("---------------------------------------------------------------------------------");
+        println!("| efSearch  | Recall@10 (Rust / FAISS) | p95 Latency (Rust / FAISS)            |");
+        println!("---------------------------------------------------------------------------------");
+    } else {
+        println!("\n+-----------+--------------+--------------+--------------+--------------+-------------+");
+        println!("| efSearch  | Recall@10    | p50 Latency  | p95 Latency  | p99 Latency  | Avg Latency |");
+        println!("+-----------+--------------+--------------+--------------+--------------+-------------+");
+    }
 
     let mut gate_p50 = 0.0;
     let mut gate_p95 = 0.0;
@@ -98,7 +211,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let p99 = latencies[(num_queries as f64 * 0.99) as usize];
         let avg = latencies.iter().sum::<f64>() / num_queries as f64;
 
-        // Evaluate recall on 100 sample queries
         let mut total_hits = 0;
         for (q_idx, q) in queries.iter().take(sample_queries).enumerate() {
             let res = collection.search_hnsw(q, k, ef)?;
@@ -117,12 +229,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gate_recall_200 = recall;
         }
 
-        println!(
-            "| {:<9} | {:<12.4} | {:<9.3} ms | {:<9.3} ms | {:<9.3} ms | {:<9.3} ms |",
-            ef, recall, p50, p95, p99, avg
-        );
+        if let Some(faiss) = &faiss_results {
+            if let Some(f_res) = faiss.search.get(&ef.to_string()) {
+                println!(
+                    "| {:<9} | {:<5.4} / {:<5.4}            | {:<6.3} ms / {:<6.3} ms          |",
+                    ef, recall, f_res.recall, p95, f_res.p95
+                );
+            }
+        } else {
+            println!(
+                "| {:<9} | {:<12.4} | {:<9.3} ms | {:<9.3} ms | {:<9.3} ms | {:<9.3} ms |",
+                ef, recall, p50, p95, p99, avg
+            );
+        }
     }
-    println!("+-----------+--------------+--------------+--------------+--------------+-------------+");
+    
+    if faiss_results.is_some() {
+        println!("---------------------------------------------------------------------------------");
+    } else {
+        println!("+-----------+--------------+--------------+--------------+--------------+-------------+");
+    }
 
     println!("\n[4/4] Running Product Quantization Memory Footprint Benchmark...");
     let raw_bytes = num_vectors * dim * std::mem::size_of::<f32>();
