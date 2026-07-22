@@ -3,3 +3,4 @@
 *.snap
 *.tmp
 .DS_Store
+vectordb-bench/data/

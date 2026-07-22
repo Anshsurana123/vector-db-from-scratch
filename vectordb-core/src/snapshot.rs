@@ -8,14 +8,22 @@ use crate::error::{Result, VectorDbError};
 use crate::hnsw::{HnswConfig, HnswIndex};
 use crate::storage::VectorStorage;
 
+fn default_concurrent_hnsw() -> crate::concurrent_hnsw::ConcurrentHnswIndex {
+    crate::concurrent_hnsw::ConcurrentHnswIndex::new(HnswConfig::default(), MetricType::L2)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CollectionSnapshotData {
     pub name: String,
     pub dim: usize,
     pub metric: MetricType,
     pub config: HnswConfig,
+    #[serde(default)]
+    pub use_concurrent_index: bool,
     pub storage: VectorStorage,
     pub hnsw: HnswIndex,
+    #[serde(default = "default_concurrent_hnsw")]
+    pub concurrent_hnsw: crate::concurrent_hnsw::ConcurrentHnswIndex,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

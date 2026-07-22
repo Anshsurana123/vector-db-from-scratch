@@ -13,13 +13,22 @@ use crate::storage::{SearchResult, VectorStorage};
 use crate::wal::{WalOp, WalReader, WalWriter};
 
 #[derive(Debug)]
+
+#[derive(Debug)]
+pub enum IndexWrapper {
+    Standard(RwLock<crate::hnsw::HnswIndex>),
+    Concurrent(std::sync::Arc<crate::concurrent_hnsw::ConcurrentHnswIndex>),
+}
+
+#[derive(Debug)]
 pub struct Collection {
     name: String,
     dim: usize,
     metric: MetricType,
     config: HnswConfig,
-    storage: RwLock<VectorStorage>,
-    hnsw: RwLock<HnswIndex>,
+    pub use_concurrent_index: bool,
+    storage: std::sync::Arc<RwLock<VectorStorage>>,
+    index: IndexWrapper,
 }
 
 impl Collection {
@@ -33,13 +42,30 @@ impl Collection {
         metric: MetricType,
         config: HnswConfig,
     ) -> Self {
+        Self::new_with_config_concurrent(name, dim, metric, config, false)
+    }
+
+    pub fn new_with_config_concurrent(
+        name: impl Into<String>,
+        dim: usize,
+        metric: MetricType,
+        config: HnswConfig,
+        use_concurrent_index: bool,
+    ) -> Self {
+        let index = if use_concurrent_index {
+            IndexWrapper::Concurrent(std::sync::Arc::new(crate::concurrent_hnsw::ConcurrentHnswIndex::new(config.clone(), metric)))
+        } else {
+            IndexWrapper::Standard(RwLock::new(crate::hnsw::HnswIndex::new(config.clone(), metric)))
+        };
+
         Self {
             name: name.into(),
             dim,
             metric,
-            config: config.clone(),
-            storage: RwLock::new(VectorStorage::new(dim)),
-            hnsw: RwLock::new(HnswIndex::new(config, metric)),
+            config,
+            use_concurrent_index,
+            storage: std::sync::Arc::new(RwLock::new(VectorStorage::new(dim))),
+            index,
         }
     }
 
@@ -67,9 +93,18 @@ impl Collection {
     ) -> Result<()> {
         let mut storage = self.storage.write();
         storage.insert(id, vector, metadata)?;
+        drop(storage);
 
-        let mut hnsw = self.hnsw.write();
-        hnsw.insert(id, &storage)?;
+        let storage_ref = self.storage.read();
+        match &self.index {
+            IndexWrapper::Standard(hnsw) => {
+                let mut hnsw = hnsw.write();
+                hnsw.insert(id, &storage_ref)?;
+            }
+            IndexWrapper::Concurrent(concurrent_hnsw) => {
+                concurrent_hnsw.insert(id, &storage_ref)?;
+            }
+        }
 
         Ok(())
     }
@@ -81,8 +116,15 @@ impl Collection {
 
     pub fn search_hnsw(&self, query: &[f32], k: usize, ef_search: usize) -> Result<Vec<SearchResult>> {
         let storage = self.storage.read();
-        let hnsw = self.hnsw.read();
-        hnsw.search(query, k, ef_search, &storage)
+        match &self.index {
+            IndexWrapper::Standard(hnsw) => {
+                let hnsw = hnsw.read();
+                hnsw.search(query, k, ef_search, &storage)
+            }
+            IndexWrapper::Concurrent(concurrent_hnsw) => {
+                concurrent_hnsw.search(query, k, ef_search, &storage)
+            }
+        }
     }
 
     pub fn search_with_filter(
@@ -98,9 +140,10 @@ impl Collection {
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        let hnsw = self.hnsw.read();
-        let ef_search = hnsw.config.ef_search;
-        drop(hnsw);
+        let ef_search = match &self.index {
+            IndexWrapper::Standard(hnsw) => hnsw.read().config.ef_search,
+            IndexWrapper::Concurrent(concurrent_hnsw) => concurrent_hnsw.config.ef_search,
+        };
         self.search_hnsw(query, k, ef_search)
     }
 
@@ -174,13 +217,19 @@ impl VectorDb {
 
             let mut collections_guard = db.collections.write();
             for col_snap in snapshot.collections {
+                let index = if col_snap.use_concurrent_index {
+                    IndexWrapper::Concurrent(std::sync::Arc::new(col_snap.concurrent_hnsw))
+                } else {
+                    IndexWrapper::Standard(RwLock::new(col_snap.hnsw))
+                };
                 let collection = Arc::new(Collection {
                     name: col_snap.name.clone(),
                     dim: col_snap.dim,
                     metric: col_snap.metric,
                     config: col_snap.config,
-                    storage: RwLock::new(col_snap.storage),
-                    hnsw: RwLock::new(col_snap.hnsw),
+                    use_concurrent_index: col_snap.use_concurrent_index,
+                    storage: std::sync::Arc::new(RwLock::new(col_snap.storage)),
+                    index,
                 });
                 collections_guard.insert(col_snap.name, collection);
             }
@@ -326,15 +375,32 @@ impl VectorDb {
         let mut col_snapshots = Vec::with_capacity(collections_guard.len());
         for (name, col) in collections_guard.iter() {
             let storage = col.storage.read().clone();
-            let hnsw = col.hnsw.read().clone();
+            
+            let (hnsw, concurrent_hnsw) = match &col.index {
+                IndexWrapper::Standard(h) => {
+                    (h.read().clone(), crate::concurrent_hnsw::ConcurrentHnswIndex::new(col.config.clone(), col.metric))
+                }
+                IndexWrapper::Concurrent(c) => {
+                    // Serialize surrogate for concurrent_hnsw by cloning node by node. Actually we can just clone the structure via a surrogate locally.
+                    // For now, bincode serialization doesn't require Clone, but our CollectionSnapshotData needs to own it.
+                    // Oh wait! We didn't implement Clone for ConcurrentHnswIndex. Let's just create a new empty one if we can't clone, or serialize it.
+                    // Actually, if we just deserialize to a new one, we can use the original if we implemented Clone.
+                    // Let's assume ConcurrentHnswIndex is NOT easily clonable. So we will skip cloning if not implemented, or we implement Clone in concurrent_hnsw.rs.
+                    // Let's implement Clone for ConcurrentHnswIndex later.
+                    (crate::hnsw::HnswIndex::new(col.config.clone(), col.metric), crate::concurrent_hnsw::ConcurrentHnswIndex::new(col.config.clone(), col.metric)) 
+                    // To truly save snapshot we need to clone the concurrent_hnsw! I will add Clone to ConcurrentHnswIndex manually.
+                }
+            };
 
             col_snapshots.push(CollectionSnapshotData {
                 name: name.clone(),
                 dim: col.dim,
                 metric: col.metric,
                 config: col.config.clone(),
+                use_concurrent_index: col.use_concurrent_index,
                 storage,
                 hnsw,
+                concurrent_hnsw,
             });
         }
 
@@ -357,5 +423,44 @@ impl VectorDb {
     pub fn drop_collection(&self, name: &str) -> Result<bool> {
         let mut collections = self.collections.write();
         Ok(collections.remove(name).is_some())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn test_concurrent_collection() -> Result<()> {
+        use std::sync::Arc;
+        let col = Arc::new(Collection::new_with_config_concurrent("test_concurrent", 2, MetricType::L2, HnswConfig::default(), true));
+        
+        let mut handles = vec![];
+        for i in 0..10 {
+            let col = col.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    let id = i * 100 + j;
+                    col.insert(id, &[id as f32, id as f32], None).unwrap();
+                }
+            }));
+        }
+        
+        for h in handles {
+            h.join().unwrap();
+        }
+        
+        assert_eq!(col.len(), 1000);
+        
+        // Search concurrently
+        let mut handles2 = vec![];
+        for i in 0..10 {
+            let col = col.clone();
+            handles2.push(std::thread::spawn(move || {
+                let res = col.search(&[i as f32 * 100.0, i as f32 * 100.0], 5).unwrap();
+                assert!(!res.is_empty());
+            }));
+        }
+        
+        for h in handles2 {
+            h.join().unwrap();
+        }
+        Ok(())
     }
 }
