@@ -1,1 +1,3 @@
-pub fn server_stub() {}
+pub mod api;
+
+pub use api::app;
