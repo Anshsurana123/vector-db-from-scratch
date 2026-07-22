@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 use parking_lot::{Mutex, RwLock};
 use rand::Rng;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 
 use crate::distance::MetricType;
 use crate::error::{Result, VectorDbError};
@@ -82,7 +81,6 @@ pub struct ConcurrentHnswIndex {
     pub config: HnswConfig,
     pub metric: MetricType,
     pub nodes: RwLock<Vec<ArcNode>>,
-    pub id_to_node_idx: RwLock<std::collections::HashMap<u64, usize>>,
     pub entry_point: AtomicUsize,
     pub max_layer: AtomicUsize,
     pub has_entry_point: std::sync::atomic::AtomicBool,
@@ -99,7 +97,6 @@ impl ConcurrentHnswIndex {
             config,
             metric,
             nodes: RwLock::new(Vec::new()),
-            id_to_node_idx: RwLock::new(std::collections::HashMap::new()),
             entry_point: AtomicUsize::new(0),
             max_layer: AtomicUsize::new(0),
             has_entry_point: std::sync::atomic::AtomicBool::new(false),
@@ -114,7 +111,7 @@ impl ConcurrentHnswIndex {
         (-r.ln() * self.config.m_l).floor() as usize
     }
 
-    /// Search a single layer `lc` with fine-grained node neighbor locks
+    /// Search a single layer `lc` with zero heap allocation per node read
     fn search_layer(
         &self,
         query: &[f32],
@@ -213,7 +210,6 @@ impl ConcurrentHnswIndex {
             let mut nodes_guard = self.nodes.write();
             let idx = nodes_guard.len();
             nodes_guard.push(std::sync::Arc::clone(&new_node));
-            self.id_to_node_idx.write().insert(id, idx);
             idx
         };
 
@@ -223,7 +219,7 @@ impl ConcurrentHnswIndex {
             return Ok(());
         }
 
-        let snapshot_nodes = self.nodes.read().clone();
+        let nodes_read = self.nodes.read();
         let curr_ep = self.entry_point.load(AtomicOrdering::SeqCst);
         let max_l = self.max_layer.load(AtomicOrdering::SeqCst);
 
@@ -231,7 +227,7 @@ impl ConcurrentHnswIndex {
 
         // 1. Top layer down to target_level + 1
         for lc in (target_level + 1..=max_l).rev() {
-            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 4, lc, storage, &snapshot_nodes);
+            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 4, lc, storage, &nodes_read);
             let top_cands: Vec<usize> = candidates.into_vec().into_iter().map(|m| m.0.idx).collect();
             if !top_cands.is_empty() {
                 ep_vec = top_cands;
@@ -247,7 +243,7 @@ impl ConcurrentHnswIndex {
                 self.config.ef_construction,
                 lc,
                 storage,
-                &snapshot_nodes,
+                &nodes_read,
             );
 
             let candidates_vec: Vec<Candidate> = candidates_heap.into_vec().into_iter().map(|m| m.0).collect();
@@ -256,9 +252,9 @@ impl ConcurrentHnswIndex {
             // Connect neighbors with fine-grained RwLock
             for cand in candidates_vec.iter().take(m_max) {
                 let nbr_idx = cand.idx;
-                if nbr_idx < snapshot_nodes.len() {
+                if nbr_idx < nodes_read.len() {
                     new_node.neighbors[lc].write().push(nbr_idx);
-                    snapshot_nodes[nbr_idx].neighbors[lc].write().push(q_node_idx);
+                    nodes_read[nbr_idx].neighbors[lc].write().push(q_node_idx);
                 }
             }
 
@@ -273,7 +269,7 @@ impl ConcurrentHnswIndex {
         Ok(())
     }
 
-    /// Parallel batch vector insertion using Rayon
+    /// Parallel batch vector insertion using Rayon chunking
     pub fn insert_batch_parallel(&self, ids: &[u64], storage: &VectorStorage) -> Result<()> {
         ids.par_iter().for_each(|&id| {
             let _ = self.insert(id, storage);
@@ -281,7 +277,7 @@ impl ConcurrentHnswIndex {
         Ok(())
     }
 
-    /// Search K nearest neighbors using HNSW graph (Algorithm 5) with fine-grained node locks
+    /// Search K nearest neighbors using HNSW graph with fine-grained node locks
     pub fn search(
         &self,
         query: &[f32],
@@ -294,7 +290,7 @@ impl ConcurrentHnswIndex {
         }
 
         let ef = std::cmp::max(ef_search, k);
-        let snapshot_nodes = self.nodes.read().clone();
+        let nodes_read = self.nodes.read();
         let curr_ep = self.entry_point.load(AtomicOrdering::SeqCst);
         let max_l = self.max_layer.load(AtomicOrdering::SeqCst);
 
@@ -302,22 +298,22 @@ impl ConcurrentHnswIndex {
 
         let ef_upper = std::cmp::min(ef, 8);
         for lc in (1..=max_l).rev() {
-            let (candidates, _) = self.search_layer(query, &ep_vec, ef_upper, lc, storage, &snapshot_nodes);
+            let (candidates, _) = self.search_layer(query, &ep_vec, ef_upper, lc, storage, &nodes_read);
             let top_cands: Vec<usize> = candidates.into_vec().into_iter().map(|m| m.0.idx).collect();
             if !top_cands.is_empty() {
                 ep_vec = top_cands;
             }
         }
 
-        let (candidates_heap, _) = self.search_layer(query, &ep_vec, ef, 0, storage, &snapshot_nodes);
+        let (candidates_heap, _) = self.search_layer(query, &ep_vec, ef, 0, storage, &nodes_read);
 
         let mut sorted_cands: Vec<Candidate> = candidates_heap
             .into_vec()
             .into_iter()
             .map(|m| m.0)
             .filter(|c| {
-                if c.idx < snapshot_nodes.len() {
-                    let id = snapshot_nodes[c.idx].id;
+                if c.idx < nodes_read.len() {
+                    let id = nodes_read[c.idx].id;
                     !storage.is_deleted(id)
                 } else {
                     false
@@ -331,7 +327,7 @@ impl ConcurrentHnswIndex {
         let results = sorted_cands
             .into_iter()
             .map(|c| {
-                let id = snapshot_nodes[c.idx].id;
+                let id = nodes_read[c.idx].id;
                 SearchResult {
                     id,
                     distance: c.distance,
