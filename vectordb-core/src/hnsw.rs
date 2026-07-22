@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::distance::MetricType;
 use crate::error::{Result, VectorDbError};
+use crate::filter::FilterExpression;
 use crate::storage::{SearchResult, VectorStorage};
 
 #[inline(always)]
@@ -533,13 +534,24 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Search K nearest neighbors using HNSW graph (Algorithm 5)
+    /// Search K nearest neighbors using HNSW graph (Algorithm 5) with optional metadata pre-filtering
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
         storage: &VectorStorage,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_with_filter(query, k, ef_search, storage, None)
+    }
+
+    pub fn search_with_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        storage: &VectorStorage,
+        filter: Option<&FilterExpression>,
     ) -> Result<Vec<SearchResult>> {
         if k == 0 || self.nodes.is_empty() {
             return Ok(Vec::new());
@@ -570,7 +582,17 @@ impl HnswIndex {
             .into_vec()
             .into_iter()
             .map(|m| m.0)
-            .filter(|c| !storage.is_deleted(self.nodes[c.idx].id))
+            .filter(|c| {
+                let id = self.nodes[c.idx].id;
+                if storage.is_deleted(id) {
+                    return false;
+                }
+                if let Some(f) = filter {
+                    f.matches_id(storage, id)
+                } else {
+                    true
+                }
+            })
             .collect();
 
         sorted_cands.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));

@@ -1,6 +1,7 @@
 pub mod collection;
 pub mod distance;
 pub mod error;
+pub mod filter;
 pub mod hnsw;
 pub mod pq;
 pub mod snapshot;
@@ -10,6 +11,7 @@ pub mod wal;
 pub use collection::{Collection, VectorDb};
 pub use distance::MetricType;
 pub use error::{Result, VectorDbError};
+pub use filter::FilterExpression;
 pub use hnsw::{HnswConfig, HnswIndex};
 pub use pq::{ProductQuantizer, QuantizedVectorStorage};
 pub use snapshot::{DbSnapshotData, SnapshotEngine};

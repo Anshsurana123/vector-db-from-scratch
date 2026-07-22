@@ -6,6 +6,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::distance::MetricType;
 use crate::error::{Result, VectorDbError};
+use crate::filter::FilterExpression;
 use crate::hnsw::{HnswConfig, HnswIndex};
 use crate::snapshot::{CollectionSnapshotData, DbSnapshotData, SnapshotEngine};
 use crate::storage::{SearchResult, VectorStorage};
@@ -82,6 +83,18 @@ impl Collection {
         let storage = self.storage.read();
         let hnsw = self.hnsw.read();
         hnsw.search(query, k, ef_search, &storage)
+    }
+
+    pub fn search_with_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &FilterExpression,
+    ) -> Result<Vec<SearchResult>> {
+        let storage = self.storage.read();
+        let hnsw = self.hnsw.read();
+        let ef_search = hnsw.config.ef_search;
+        hnsw.search_with_filter(query, k, ef_search, &storage, Some(filter))
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
