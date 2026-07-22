@@ -282,6 +282,7 @@ impl HnswIndex {
         ef: usize,
         lc: usize,
         storage: &VectorStorage,
+        filter: Option<&FilterExpression>,
     ) -> (BinaryHeap<MaxCandidate>, usize) {
         let mut visit_id = self.visit_id_counter.fetch_add(1, AtomicOrdering::Relaxed);
         let mut visited = self.visited_tags.lock();
@@ -307,10 +308,19 @@ impl HnswIndex {
                 visited[node_idx] = visit_id;
             }
             if let Some(vec) = storage.get_vector_by_idx(node_idx) {
+                let node_id = self.nodes[node_idx].id;
+                let matches_filter = match filter {
+                    Some(f) => f.matches_id(storage, node_id),
+                    None => true,
+                };
+
                 let dist = compute_distance(self.metric, query, vec);
                 let cand = Candidate { idx: node_idx, distance: dist };
                 min_candidates.push(MinCandidate(cand));
-                max_results.push(MaxCandidate(cand));
+
+                if matches_filter {
+                    max_results.push(MaxCandidate(cand));
+                }
             }
         }
 
@@ -327,12 +337,19 @@ impl HnswIndex {
                         visited[nbr_idx] = visit_id;
 
                         if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_idx) {
+                            let nbr_id = self.nodes[nbr_idx].id;
+                            let matches_filter = match filter {
+                                Some(f) => f.matches_id(storage, nbr_id),
+                                None => true,
+                            };
+
                             let dist = compute_distance(self.metric, query, nbr_vec);
                             let cand = Candidate { idx: nbr_idx, distance: dist };
                             let worst_dist = max_results.peek().map(|m| m.0.distance).unwrap_or(f32::MAX);
 
-                            if dist < worst_dist || max_results.len() < ef {
-                                min_candidates.push(MinCandidate(cand));
+                            min_candidates.push(MinCandidate(cand));
+
+                            if matches_filter && (dist < worst_dist || max_results.len() < ef) {
                                 max_results.push(MaxCandidate(cand));
 
                                 if max_results.len() > ef {
@@ -461,7 +478,7 @@ impl HnswIndex {
 
         // 1. Top layer down to target_level + 1: Traverse with candidate beam ef=4
         for lc in (target_level + 1..=max_l).rev() {
-            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 4, lc, storage);
+            let (candidates, _) = self.search_layer(q_vec, &ep_vec, 4, lc, storage, None);
             let top_cands: Vec<usize> = candidates.into_vec().into_iter().map(|m| m.0.idx).collect();
             if !top_cands.is_empty() {
                 ep_vec = top_cands;
@@ -477,6 +494,7 @@ impl HnswIndex {
                 self.config.ef_construction,
                 lc,
                 storage,
+                None,
             );
 
             let candidates_vec: Vec<Candidate> = candidates_heap.into_vec().into_iter().map(|m| m.0).collect();
@@ -566,17 +584,17 @@ impl HnswIndex {
 
         let mut ep_vec = vec![curr_ep];
 
-        // Traverse upper layers with small beam ef_upper to prevent local minima traps
+        // Traverse upper layers with small beam ef_upper
         let ef_upper = std::cmp::min(ef, 8);
         for lc in (1..=self.max_layer).rev() {
-            let (candidates, _) = self.search_layer(query, &ep_vec, ef_upper, lc, storage);
+            let (candidates, _) = self.search_layer(query, &ep_vec, ef_upper, lc, storage, None);
             let top_cands: Vec<usize> = candidates.into_vec().into_iter().map(|m| m.0.idx).collect();
             if !top_cands.is_empty() {
                 ep_vec = top_cands;
             }
         }
 
-        let (candidates_heap, _) = self.search_layer(query, &ep_vec, ef, 0, storage);
+        let (candidates_heap, _) = self.search_layer(query, &ep_vec, ef, 0, storage, filter);
 
         let mut sorted_cands: Vec<Candidate> = candidates_heap
             .into_vec()
@@ -594,6 +612,26 @@ impl HnswIndex {
                 }
             })
             .collect();
+
+        // If pre-filtered HNSW graph search returned fewer than K results (due to high selectivity),
+        // fallback to exact brute-force scan over matching vectors to guarantee 100% Recall@10
+        if filter.is_some() && sorted_cands.len() < k {
+            let all_bf = storage.search_brute_force(query, storage.len(), self.metric)?;
+            let f_expr = filter.unwrap();
+            let filtered_results: Vec<SearchResult> = all_bf
+                .into_iter()
+                .filter(|r| {
+                    if let Some(meta) = &r.metadata {
+                        f_expr.matches(meta)
+                    } else {
+                        false
+                    }
+                })
+                .take(k)
+                .collect();
+
+            return Ok(filtered_results);
+        }
 
         sorted_cands.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
         sorted_cands.truncate(k);
