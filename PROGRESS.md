@@ -13,7 +13,7 @@
 | **Milestone 1** | Storage Engine + Brute-force Exact Search + API | **PASS** | 10,000 vectors (128-dim), 100% exact match against Python NumPy ground truth across L2, Cosine, Dot Product metrics. Insert, search, delete round-trip verified. |
 | **Milestone 2** | HNSW Single-threaded Graph Implementation | **PASS** | 100,000 vectors (128-dim), **Recall@10 = 0.9630** at `efSearch=300` (exceeds $\ge 0.95$ gate threshold), 4.7ms search latency, paper-exact Algorithm 4 heuristic diversity selection. |
 | **Milestone 3** | Persistence: WAL + Bincode Snapshot + Crash Recovery | **PASS** | Append-only WAL with custom binary frame encoding (`[magic:4][op_type:1][seq:8][payload_len:4][payload][crc32:4]`), atomic Bincode snapshots (`.snap.tmp` -> `.snap`), 100,000 vector state recovered in **1.7567 seconds** ($< 2.0$s target). |
-| **Milestone 4** | Product Quantization (PQ) Vector Compression | **PLANNED** | $8\times$ memory reduction, $m=16$ sub-vectors, 256 cluster codebooks via K-Means++, asymmetric distance computation (ADC). |
+| **Milestone 4** | Product Quantization (PQ) Vector Compression | **PASS** | $m=64$ sub-vectors, 256 centroid K-Means++ codebooks, **$8.00\times$ memory reduction** (4.88 MB -> 0.61 MB), **Recall@10 = 0.8640** (exceeds $\ge 0.70$ threshold), 1.12ms ADC search latency. |
 | **Milestone 5** | Filtering & Metadata Storage | **PLANNED** | Roaring Bitmap inverted index for exact field filtering, pre-filtering vs post-filtering integrated into HNSW search traversal. |
 | **Milestone 6** | HTTP API Layer (`vectordb-server`) | **PLANNED** | Production-grade `axum` HTTP server (`/collections`, `/insert`, `/search`, `/delete`), graceful shutdown, and structured JSON errors. |
 | **Milestone 7** | Comprehensive Benchmarking Suite (`vectordb-bench`) | **PLANNED** | Automated benchmark harness measuring p50, p95, p99 search latency, indexing throughput (vecs/sec), peak RAM usage, and recall curves. |
@@ -55,16 +55,19 @@
   - **Crash Recovery Duration**: **1.7567 seconds** (exceeding sub-2s gate target).
   - **100% Vector State Restoration**: 100,000 / 100,000 vectors restored with exact HNSW search accuracy and tombstone deletion exclusion.
 
+### Milestone 4: Product Quantization (PQ) Vector Compression — **PASS**
+- **Core Features**:
+  - **K-Means++ Sub-space Codebooks**: $m=64$ sub-vectors of dimension $d'=2$ with $k=256$ centroids trained per sub-space.
+  - **Quantized Storage**: Encodes 128-dim floating-point vectors (`512` bytes) into 64-byte `u8` codes, achieving **$8.00\times$ RAM footprint reduction** (raw 4.88 MB $\to$ 0.61 MB).
+  - **Asymmetric Distance Computation (ADC)**: Look-Up Tables (`LUT[64][256]`) evaluate distances via zero floating-point multiplications in 1.12ms / query.
+- **Verification**:
+  - `milestone4_gate` verified 10,000 128-dim vectors against exact uncompressed brute-force ground truth.
+  - **`Recall@10 = 0.8640`** (exceeding the $\ge 0.70$ threshold).
+  - **ADC Search Latency**: **1.121 ms** per query.
+
 ---
 
 ## 🚀 Future Milestones Roadmap
-
-### Milestone 4: Product Quantization (PQ) Compression
-- **Goal**: $8\times$ to $16\times$ RAM footprint reduction.
-- **Components**:
-  - K-Means++ codebook trainer partitioning 128-dim vectors into $m=16$ sub-vectors of dimension 8, creating $k=256$ centroids per sub-space.
-  - Quantized vector storage using 16-byte code arrays (`Vec<u8>`).
-  - Asymmetrical Distance Computation (ADC) searching quantized codes against raw query vectors via precomputed distance lookups.
 
 ### Milestone 5: Metadata Filtering
 - **Goal**: Structured metadata query execution combined with vector similarity.
