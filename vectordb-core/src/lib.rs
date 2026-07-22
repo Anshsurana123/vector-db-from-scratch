@@ -1,4 +1,5 @@
 pub mod collection;
+pub mod concurrent_hnsw;
 pub mod distance;
 pub mod error;
 pub mod filter;
@@ -9,6 +10,7 @@ pub mod storage;
 pub mod wal;
 
 pub use collection::{Collection, VectorDb};
+pub use concurrent_hnsw::ConcurrentHnswIndex;
 pub use distance::MetricType;
 pub use error::{Result, VectorDbError};
 pub use filter::FilterExpression;
