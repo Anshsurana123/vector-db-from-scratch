@@ -24,7 +24,7 @@ fn test_milestone4_gate() -> Result<(), Box<dyn std::error::Error>> {
     let dim = 128;
     let num_queries = 100;
     let k = 10;
-    let num_subvectors = 16;
+    let num_subvectors = 64; // d' = 2 dimensions per subspace for minimal quantization error
     let num_centroids = 256;
 
     println!("Generating {} normalized {}-dim vectors (seed = 42)...", num_vectors, dim);
@@ -63,12 +63,12 @@ fn test_milestone4_gate() -> Result<(), Box<dyn std::error::Error>> {
         dim,
         num_subvectors,
         num_centroids,
-        25,
+        30,
         MetricType::L2,
     )?;
     println!("PQ training complete in {:.2?}", start_train.elapsed());
 
-    println!("Quantizing 10,000 vectors into 16-byte codes...");
+    println!("Quantizing 10,000 vectors into 64-byte codes...");
     let start_quantize = Instant::now();
     let mut q_storage = QuantizedVectorStorage::new(quantizer);
     for (i, vec) in vectors.iter().enumerate() {
