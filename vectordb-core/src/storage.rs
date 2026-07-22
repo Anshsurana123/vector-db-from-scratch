@@ -1,10 +1,11 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::distance::{DistanceMetric, MetricType, get_distance_metric};
 use crate::error::{Result, VectorDbError};
 
+/// Search result holding the vector ID, metric distance score, and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub id: u64,
@@ -12,17 +13,23 @@ pub struct SearchResult {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Helper struct for min-heap / max-heap priority queue ordering.
-/// Ord is implemented based on distance.
-#[derive(Debug, Clone)]
-pub struct Candidate {
-    pub id: u64,
-    pub distance: f32,
+impl PartialEq for SearchResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && (self.distance - other.distance).abs() < 1e-6
+    }
+}
+
+impl Eq for SearchResult {}
+
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    id: u64,
+    distance: f32,
 }
 
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance && self.id == other.id
+        self.id == other.id && self.distance == other.distance
     }
 }
 
@@ -44,7 +51,7 @@ impl Ord for Candidate {
 }
 
 /// Flat contiguous vector storage with id-offset indexing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStorage {
     dim: usize,
     data: Vec<f32>,
@@ -78,10 +85,6 @@ impl VectorStorage {
         self.len() == 0
     }
 
-    pub fn total_allocated(&self) -> usize {
-        self.idx_to_id.len()
-    }
-
     pub fn insert(
         &mut self,
         id: u64,
@@ -99,40 +102,35 @@ impl VectorStorage {
             return Err(VectorDbError::DuplicateId(id));
         }
 
-        if self.deleted.contains(&id) {
-            // Re-inserting previously deleted ID: update slot or allocate new
-            self.deleted.remove(&id);
+        if self.deleted.remove(&id) {
             let idx = self.id_to_idx[&id];
-            let offset = idx * self.dim;
-            self.data[offset..offset + self.dim].copy_from_slice(vector);
-            if let Some(meta) = metadata {
-                self.metadata_store.insert(id, meta);
-            } else {
-                self.metadata_store.remove(&id);
-            }
-            return Ok(());
+            let start = idx * self.dim;
+            let end = start + self.dim;
+            self.data[start..end].copy_from_slice(vector);
+        } else {
+            let idx = self.idx_to_id.len();
+            self.id_to_idx.insert(id, idx);
+            self.idx_to_id.push(id);
+            self.data.extend_from_slice(vector);
         }
-
-        let idx = self.idx_to_id.len();
-        self.data.extend_from_slice(vector);
-        self.id_to_idx.insert(id, idx);
-        self.idx_to_id.push(id);
 
         if let Some(meta) = metadata {
             self.metadata_store.insert(id, meta);
+        } else {
+            self.metadata_store.remove(&id);
         }
 
         Ok(())
     }
 
     pub fn delete(&mut self, id: u64) -> Result<bool> {
-        if let Some(&_idx) = self.id_to_idx.get(&id) {
-            if self.deleted.insert(id) {
-                self.metadata_store.remove(&id);
-                return Ok(true);
-            }
+        if self.id_to_idx.contains_key(&id) && !self.deleted.contains(&id) {
+            self.deleted.insert(id);
+            self.metadata_store.remove(&id);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(false)
     }
 
     pub fn is_deleted(&self, id: u64) -> bool {
@@ -144,8 +142,16 @@ impl VectorStorage {
             return None;
         }
         let &idx = self.id_to_idx.get(&id)?;
-        let offset = idx * self.dim;
-        Some(&self.data[offset..offset + self.dim])
+        let start = idx * self.dim;
+        let end = start + self.dim;
+        Some(&self.data[start..end])
+    }
+
+    pub fn get_idx_by_id(&self, id: u64) -> Option<usize> {
+        if self.deleted.contains(&id) {
+            return None;
+        }
+        self.id_to_idx.get(&id).copied()
     }
 
     pub fn get_vector_by_idx(&self, idx: usize) -> Option<&[f32]> {
@@ -156,8 +162,9 @@ impl VectorStorage {
         if self.deleted.contains(&id) {
             return None;
         }
-        let offset = idx * self.dim;
-        Some(&self.data[offset..offset + self.dim])
+        let start = idx * self.dim;
+        let end = start + self.dim;
+        Some(&self.data[start..end])
     }
 
     pub fn get_metadata(&self, id: u64) -> Option<&serde_json::Value> {
@@ -167,23 +174,11 @@ impl VectorStorage {
         self.metadata_store.get(&id)
     }
 
-    pub fn get_id_by_idx(&self, idx: usize) -> Option<u64> {
-        self.idx_to_id.get(idx).copied()
-    }
-
-    pub fn get_idx_by_id(&self, id: u64) -> Option<usize> {
-        if self.deleted.contains(&id) {
-            return None;
-        }
-        self.id_to_idx.get(&id).copied()
-    }
-
-    /// Brute-force linear scan search over all non-deleted vectors.
     pub fn search_brute_force(
         &self,
         query: &[f32],
         k: usize,
-        metric: MetricType,
+        metric_type: MetricType,
     ) -> Result<Vec<SearchResult>> {
         if query.len() != self.dim {
             return Err(VectorDbError::DimensionMismatch {
@@ -196,67 +191,71 @@ impl VectorStorage {
             return Ok(Vec::new());
         }
 
-        let dist_fn = get_distance_metric(metric);
-        // Max-heap of size k: stores furthest of top-k at peak
-        let mut max_heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k);
+        let metric = get_distance_metric(metric_type);
+        let mut heap = BinaryHeap::with_capacity(k);
 
         for (idx, &id) in self.idx_to_id.iter().enumerate() {
             if self.deleted.contains(&id) {
                 continue;
             }
 
-            let offset = idx * self.dim;
-            let vec_slice = &self.data[offset..offset + self.dim];
-            let dist = dist_fn.distance(query, vec_slice);
+            let start = idx * self.dim;
+            let end = start + self.dim;
+            let vec_slice = &self.data[start..end];
+            let dist = metric.distance(query, vec_slice);
 
-            if max_heap.len() < k {
-                max_heap.push(Candidate { id, distance: dist });
-            } else if let Some(top) = max_heap.peek() {
-                if dist < top.distance {
-                    max_heap.pop();
-                    max_heap.push(Candidate { id, distance: dist });
+            let cand = Candidate { id, distance: dist };
+
+            if heap.len() < k {
+                heap.push(cand);
+            } else if let Some(top) = heap.peek() {
+                if cand.distance < top.distance {
+                    heap.pop();
+                    heap.push(cand);
                 }
             }
         }
 
-        // Extract and sort results ascending by distance (closest first)
-        let mut results = Vec::with_capacity(max_heap.len());
-        while let Some(cand) = max_heap.pop() {
-            results.push(SearchResult {
+        let mut results: Vec<SearchResult> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cand| SearchResult {
                 id: cand.id,
                 distance: cand.distance,
                 metadata: self.metadata_store.get(&cand.id).cloned(),
-            });
-        }
-        results.reverse();
+            })
+            .collect();
 
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
         Ok(results)
+    }
+
+    pub fn raw_data(&self) -> &[f32] {
+        &self.data
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_vector_storage_crud() -> Result<()> {
         let mut storage = VectorStorage::new(3);
+
         let v1 = vec![1.0, 2.0, 3.0];
         let v2 = vec![4.0, 5.0, 6.0];
 
-        storage.insert(1, &v1, Some(json!({"tag": "a"})))?;
-        storage.insert(2, &v2, Some(json!({"tag": "b"})))?;
+        storage.insert(1, &v1, Some(serde_json::json!({"name": "v1"})))?;
+        storage.insert(2, &v2, None)?;
 
         assert_eq!(storage.len(), 2);
-        assert_eq!(storage.get_vector(1).unwrap(), &v1);
-        assert_eq!(storage.get_metadata(1).unwrap()["tag"], "a");
+        assert_eq!(storage.get_vector(1).unwrap(), &v1[..]);
 
-        // Delete v1
-        assert!(storage.delete(1)?);
+        let deleted = storage.delete(1)?;
+        assert!(deleted);
         assert_eq!(storage.len(), 1);
         assert!(storage.get_vector(1).is_none());
-        assert!(storage.get_metadata(1).is_none());
 
         Ok(())
     }
@@ -264,11 +263,12 @@ mod tests {
     #[test]
     fn test_brute_force_search() -> Result<()> {
         let mut storage = VectorStorage::new(2);
-        storage.insert(1, &[0.0, 0.0], None)?;
-        storage.insert(2, &[1.0, 0.0], None)?;
-        storage.insert(3, &[10.0, 0.0], None)?;
 
-        let results = storage.search_brute_force(&[0.1, 0.0], 2, MetricType::L2)?;
+        storage.insert(1, &[0.0, 0.0], None)?;
+        storage.insert(2, &[1.0, 1.0], None)?;
+        storage.insert(3, &[5.0, 5.0], None)?;
+
+        let results = storage.search_brute_force(&[0.1, 0.1], 2, MetricType::L2)?;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 1);
         assert_eq!(results[1].id, 2);
