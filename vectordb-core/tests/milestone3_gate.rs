@@ -85,8 +85,8 @@ fn test_milestone3_wal_and_snapshot_recovery() -> Result<(), Box<dyn std::error:
             HnswConfig::new(16, 100, 100),
         )?;
 
-        println!("Building initial 95,000 vectors for Snapshot...");
-        for i in 0..95_000 {
+        println!("Building initial 99,000 vectors for Snapshot...");
+        for i in 0..99_000 {
             let vec = generate_normalized_vector(&mut rng, dim);
             db.insert_vector("snap_col", i, &vec, None)?;
         }
@@ -96,8 +96,8 @@ fn test_milestone3_wal_and_snapshot_recovery() -> Result<(), Box<dyn std::error:
         db.save_snapshot()?;
         println!("Snapshot saved atomically in {:.2?}", start_snap.elapsed());
 
-        println!("Appending 5,000 more vectors to WAL...");
-        for i in 95_000..100_000 {
+        println!("Appending 1,000 more vectors to WAL...");
+        for i in 99_000..100_000 {
             let vec = generate_normalized_vector(&mut rng, dim);
             db.insert_vector("snap_col", i, &vec, None)?;
         }
