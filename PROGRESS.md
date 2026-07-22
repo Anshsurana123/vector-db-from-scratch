@@ -15,7 +15,7 @@
 | **Milestone 3** | Persistence: WAL + Bincode Snapshot + Crash Recovery | **PASS** | Append-only WAL with custom binary frame encoding (`[magic:4][op_type:1][seq:8][payload_len:4][payload][crc32:4]`), atomic Bincode snapshots (`.snap.tmp` -> `.snap`), 100,000 vector state recovered in **1.7567 seconds** ($< 2.0$s target). |
 | **Milestone 4** | Product Quantization (PQ) Vector Compression | **PASS** | $m=64$ sub-vectors, 256 centroid K-Means++ codebooks, **$8.00\times$ memory reduction** (4.88 MB -> 0.61 MB), **Recall@10 = 0.8640** (exceeds $\ge 0.70$ threshold), 1.12ms ADC search latency. |
 | **Milestone 5** | Filtering & Metadata Storage | **PASS** | Structured JSON metadata expression evaluator (`Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `In`, `And`, `Or`), true HNSW graph pre-filtering, **0 false positives**, **Recall@10 = 1.0000** ($\ge 0.95$ threshold). |
-| **Milestone 6** | HTTP API Layer (`vectordb-server`) | **PLANNED** | Production-grade `axum` HTTP server (`/collections`, `/insert`, `/search`, `/delete`), graceful shutdown, and structured JSON errors. |
+| **Milestone 6** | HTTP API Layer (`vectordb-server`) | **PASS** | Axum v0.7 REST server (`POST /collections`, `POST /insert`, `POST /search`, `DELETE /vectors/:id`), 100% 200 OK / 201 Created HTTP responses across 1,000 vector network queries. |
 | **Milestone 7** | Comprehensive Benchmarking Suite (`vectordb-bench`) | **PLANNED** | Automated benchmark harness measuring p50, p95, p99 search latency, indexing throughput (vecs/sec), peak RAM usage, and recall curves. |
 | **Milestone 8** | Concurrent Graph Mutation & Thread-Safe Indexing | **PLANNED** | Multi-threaded HNSW graph construction via `lockfree` / coarse-grained lock isolation, lock-free read-side traversal during concurrent inserts. |
 
@@ -74,15 +74,16 @@
   - **Filter Correctness**: **0 false positives** (100% of returned vectors satisfied filter expressions).
   - **Filtered Recall@10**: **`Recall@10 = 1.0000`** (exceeding the $\ge 0.95$ gate threshold).
 
+### Milestone 6: HTTP API Layer (`vectordb-server`) — **PASS**
+- **Core Features**:
+  - **Axum REST Web Server**: Exposes REST endpoints (`POST /collections`, `GET /collections/:name`, `POST /collections/:name/insert`, `POST /collections/:name/search`, `DELETE /collections/:name/vectors/:id`) over TCP sockets with Serde JSON DTOs and structured error handling.
+- **Verification**:
+  - `milestone6_gate` verified REST API over local TCP socket.
+  - 1,000 vector insertions (`200 OK`), vector search (`200 OK`), and vector deletion (`200 OK`) passed in **0.60s**.
+
 ---
 
 ## 🚀 Future Milestones Roadmap
-
-### Milestone 6: Axum HTTP REST Server
-- **Goal**: Network API endpoints for vector operations.
-- **Components**:
-  - REST endpoints: `POST /collections`, `POST /collections/:name/insert`, `POST /collections/:name/search`, `DELETE /collections/:name/vectors/:id`.
-  - Serde JSON requests/responses and Tokio async runtime integration.
 
 ### Milestone 7: Custom Benchmark Engine (`vectordb-bench`)
 - **Goal**: Reproducible portfolio benchmark reporting.
