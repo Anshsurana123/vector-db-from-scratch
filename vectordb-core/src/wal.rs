@@ -36,6 +36,7 @@ pub struct WalFrame {
     pub op: WalOp,
 }
 
+#[derive(Debug)]
 pub struct WalWriter {
     file_path: PathBuf,
     writer: BufWriter<File>,
@@ -94,17 +95,10 @@ impl WalWriter {
 
     pub fn truncate(&mut self) -> Result<()> {
         self.writer.flush()?;
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.file_path)?;
+        let file = self.writer.get_mut();
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
         file.sync_all()?;
-        let app_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_path)?;
-        self.writer = BufWriter::new(app_file);
         Ok(())
     }
 
@@ -212,6 +206,39 @@ impl WalReader {
         }
 
         Ok((frames, last_valid_offset))
+    }
+
+    pub fn read_all_dir(dir: impl AsRef<Path>) -> Result<Vec<WalFrame>> {
+        let dir_ref = dir.as_ref();
+        if !dir_ref.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_frames = Vec::new();
+
+        if dir_ref.is_file() {
+            let (frames, _) = Self::read_all(dir_ref)?;
+            return Ok(frames);
+        }
+
+        for entry in std::fs::read_dir(dir_ref)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let is_wal_file = path
+                    .extension()
+                    .map(|ext| ext == "wal" || ext == "log")
+                    .unwrap_or(false);
+
+                if is_wal_file {
+                    let (frames, _) = Self::read_all(&path)?;
+                    all_frames.extend(frames);
+                }
+            }
+        }
+
+        all_frames.sort_by_key(|f| f.seq);
+        Ok(all_frames)
     }
 }
 

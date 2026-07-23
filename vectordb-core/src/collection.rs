@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 
 use crate::distance::MetricType;
@@ -28,6 +28,7 @@ pub struct Collection {
     storage: std::sync::Arc<RwLock<VectorStorage>>,
     index: IndexWrapper,
     pq: RwLock<Option<crate::pq::QuantizedVectorStorage>>,
+    pub wal_writer: Mutex<Option<WalWriter>>,
 }
 
 impl Collection {
@@ -66,6 +67,7 @@ impl Collection {
             storage: std::sync::Arc::new(RwLock::new(VectorStorage::new(dim))),
             index,
             pq: RwLock::new(None),
+            wal_writer: Mutex::new(None),
         }
     }
 
@@ -301,6 +303,9 @@ pub struct VectorDb {
     collections: RwLock<HashMap<String, Arc<Collection>>>,
     last_seq: AtomicU64,
     wal_writer: Mutex<Option<WalWriter>>,
+    is_snapshotting: AtomicBool,
+    ops_since_snapshot: AtomicU64,
+    auto_snapshot_threshold: AtomicU64,
 }
 
 impl std::fmt::Debug for VectorDb {
@@ -309,6 +314,7 @@ impl std::fmt::Debug for VectorDb {
             .field("db_dir", &self.db_dir)
             .field("collections", &self.collections.read().keys().collect::<Vec<_>>())
             .field("last_seq", &self.last_seq.load(Ordering::Relaxed))
+            .field("is_snapshotting", &self.is_snapshotting.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -320,7 +326,14 @@ impl VectorDb {
             collections: RwLock::new(HashMap::new()),
             last_seq: AtomicU64::new(0),
             wal_writer: Mutex::new(None),
+            is_snapshotting: AtomicBool::new(false),
+            ops_since_snapshot: AtomicU64::new(0),
+            auto_snapshot_threshold: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_auto_snapshot_threshold(&self, threshold: u64) {
+        self.auto_snapshot_threshold.store(threshold, Ordering::SeqCst);
     }
 
     pub fn open(db_dir: impl AsRef<Path>) -> Result<Self> {
@@ -332,6 +345,9 @@ impl VectorDb {
             collections: RwLock::new(HashMap::new()),
             last_seq: AtomicU64::new(0),
             wal_writer: Mutex::new(None),
+            is_snapshotting: AtomicBool::new(false),
+            ops_since_snapshot: AtomicU64::new(0),
+            auto_snapshot_threshold: AtomicU64::new(0),
         };
 
         // 1. Load Snapshot if present
@@ -349,6 +365,8 @@ impl VectorDb {
                 } else {
                     IndexWrapper::Standard(RwLock::new(col_snap.hnsw))
                 };
+                let col_wal_path = dir.join(format!("wal_{}.wal", col_snap.name));
+                let col_wal_writer = WalWriter::open(&col_wal_path).ok();
                 let collection = Arc::new(Collection {
                     name: col_snap.name.clone(),
                     dim: col_snap.dim,
@@ -358,14 +376,14 @@ impl VectorDb {
                     storage: std::sync::Arc::new(RwLock::new(col_snap.storage)),
                     index,
                     pq: RwLock::new(col_snap.pq_storage),
+                    wal_writer: Mutex::new(col_wal_writer),
                 });
                 collections_guard.insert(col_snap.name, collection);
             }
         }
 
-        // 2. Replay WAL operations with seq > start_seq
-        let wal_path = dir.join("wal.wal");
-        let (frames, _) = WalReader::read_all(&wal_path)?;
+        // 2. Replay multi-file WAL operations with seq > start_seq
+        let frames = WalReader::read_all_dir(&dir)?;
 
         for frame in frames {
             if frame.seq > start_seq {
@@ -376,8 +394,9 @@ impl VectorDb {
             }
         }
 
-        // 3. Open WAL for future appends
-        let writer = WalWriter::open(&wal_path)?;
+        // 3. Open system WAL for DDL appends
+        let system_wal_path = dir.join("wal_system.wal");
+        let writer = WalWriter::open(&system_wal_path)?;
         *db.wal_writer.lock() = Some(writer);
 
         Ok(db)
@@ -388,8 +407,14 @@ impl VectorDb {
             WalOp::CreateCollection { name, dim, metric, config } => {
                 let mut collections = self.collections.write();
                 if !collections.contains_key(name) {
-                    let col = Arc::new(Collection::new_with_config(name.clone(), *dim, *metric, config.clone()));
-                    collections.insert(name.clone(), col);
+                    let col = Collection::new_with_config(name.clone(), *dim, *metric, config.clone());
+                    if let Some(dir) = &self.db_dir {
+                        let col_wal_path = dir.join(format!("wal_{}.wal", name));
+                        if let Ok(w) = WalWriter::open(&col_wal_path) {
+                            *col.wal_writer.lock() = Some(w);
+                        }
+                    }
+                    collections.insert(name.clone(), Arc::new(col));
                 }
             }
             WalOp::Insert { collection, id, vector, metadata } => {
@@ -402,6 +427,16 @@ impl VectorDb {
             }
         }
         Ok(())
+    }
+
+    fn check_auto_snapshot(&self) {
+        let threshold = self.auto_snapshot_threshold.load(Ordering::Relaxed);
+        if threshold > 0 {
+            let ops = self.ops_since_snapshot.fetch_add(1, Ordering::SeqCst) + 1;
+            if ops >= threshold {
+                let _ = self.save_snapshot();
+            }
+        }
     }
 
     pub fn create_collection(
@@ -426,10 +461,18 @@ impl VectorDb {
             return Err(VectorDbError::CollectionAlreadyExists(name_str));
         }
 
-        let collection = Arc::new(Collection::new_with_config(name_str.clone(), dim, metric, config.clone()));
+        let col = Collection::new_with_config(name_str.clone(), dim, metric, config.clone());
+        if let Some(dir) = &self.db_dir {
+            let col_wal_path = dir.join(format!("wal_{}.wal", name_str));
+            if let Ok(writer) = WalWriter::open(&col_wal_path) {
+                *col.wal_writer.lock() = Some(writer);
+            }
+        }
+
+        let collection = Arc::new(col);
         collections.insert(name_str.clone(), Arc::clone(&collection));
 
-        // WAL Log
+        // Log DDL op in system WAL
         let mut wal_guard = self.wal_writer.lock();
         if let Some(writer) = wal_guard.as_mut() {
             let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -456,19 +499,28 @@ impl VectorDb {
         let col = self.get_collection(collection_name)?;
         col.insert(id, vector, metadata.clone())?;
 
-        let mut wal_guard = self.wal_writer.lock();
-        if let Some(writer) = wal_guard.as_mut() {
-            let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let op = WalOp::Insert {
-                collection: collection_name.to_string(),
-                id,
-                vector: vector.to_vec(),
-                metadata,
-            };
+        let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let op = WalOp::Insert {
+            collection: collection_name.to_string(),
+            id,
+            vector: vector.to_vec(),
+            metadata,
+        };
+
+        // Write to collection's WAL if available; fallback to system WAL
+        let mut col_wal = col.wal_writer.lock();
+        if let Some(writer) = col_wal.as_mut() {
             writer.append(seq, &op)?;
             writer.flush()?;
+        } else {
+            let mut wal_guard = self.wal_writer.lock();
+            if let Some(writer) = wal_guard.as_mut() {
+                writer.append(seq, &op)?;
+                writer.flush()?;
+            }
         }
 
+        self.check_auto_snapshot();
         Ok(())
     }
 
@@ -477,22 +529,50 @@ impl VectorDb {
         let deleted = col.delete(id)?;
 
         if deleted {
-            let mut wal_guard = self.wal_writer.lock();
-            if let Some(writer) = wal_guard.as_mut() {
-                let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let op = WalOp::Delete {
-                    collection: collection_name.to_string(),
-                    id,
-                };
+            let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let op = WalOp::Delete {
+                collection: collection_name.to_string(),
+                id,
+            };
+
+            let mut col_wal = col.wal_writer.lock();
+            if let Some(writer) = col_wal.as_mut() {
                 writer.append(seq, &op)?;
                 writer.flush()?;
+            } else {
+                let mut wal_guard = self.wal_writer.lock();
+                if let Some(writer) = wal_guard.as_mut() {
+                    writer.append(seq, &op)?;
+                    writer.flush()?;
+                }
             }
+
+            self.check_auto_snapshot();
         }
 
         Ok(deleted)
     }
 
     pub fn save_snapshot(&self) -> Result<PathBuf> {
+        // Single-flight check to prevent concurrent snapshot saving
+        if self
+            .is_snapshotting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(VectorDbError::StorageError(
+                "Snapshot already in progress".into(),
+            ));
+        }
+
+        struct SnapshotGuard<'a>(&'a AtomicBool);
+        impl<'a> Drop for SnapshotGuard<'a> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = SnapshotGuard(&self.is_snapshotting);
+
         let dir_buf;
         let dir = match &self.db_dir {
             Some(d) => d.as_path(),
@@ -509,14 +589,16 @@ impl VectorDb {
         let mut col_snapshots = Vec::with_capacity(collections_guard.len());
         for (name, col) in collections_guard.iter() {
             let storage = col.storage.read().clone();
-            
+
             let (hnsw, concurrent_hnsw) = match &col.index {
-                IndexWrapper::Standard(h) => {
-                    (h.read().clone(), crate::concurrent_hnsw::ConcurrentHnswIndex::new(col.config.clone(), col.metric))
-                }
-                IndexWrapper::Concurrent(c) => {
-                    (crate::hnsw::HnswIndex::new(col.config.clone(), col.metric), c.as_ref().clone())
-                }
+                IndexWrapper::Standard(h) => (
+                    h.read().clone(),
+                    crate::concurrent_hnsw::ConcurrentHnswIndex::new(col.config.clone(), col.metric),
+                ),
+                IndexWrapper::Concurrent(c) => (
+                    crate::hnsw::HnswIndex::new(col.config.clone(), col.metric),
+                    c.as_ref().clone(),
+                ),
             };
 
             col_snapshots.push(CollectionSnapshotData {
@@ -539,11 +621,20 @@ impl VectorDb {
 
         let snap_path = SnapshotEngine::save_snapshot_atomic(dir, &db_snap)?;
 
+        // Truncate system WAL and all per-collection WALs after atomic save succeeds
         let mut wal_guard = self.wal_writer.lock();
         if let Some(writer) = wal_guard.as_mut() {
             writer.truncate()?;
         }
 
+        for col in collections_guard.values() {
+            let mut col_wal = col.wal_writer.lock();
+            if let Some(writer) = col_wal.as_mut() {
+                let _ = writer.truncate();
+            }
+        }
+
+        self.ops_since_snapshot.store(0, Ordering::SeqCst);
         Ok(snap_path)
     }
 
