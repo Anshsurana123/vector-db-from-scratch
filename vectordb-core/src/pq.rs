@@ -290,6 +290,8 @@ pub struct QuantizedVectorStorage {
     pub codes: Vec<Vec<u8>>,
     pub ids: Vec<u64>,
     pub id_to_idx: std::collections::HashMap<u64, usize>,
+    #[serde(default)]
+    pub deleted: std::collections::HashSet<u64>,
 }
 
 impl QuantizedVectorStorage {
@@ -301,16 +303,36 @@ impl QuantizedVectorStorage {
             codes: Vec::new(),
             ids: Vec::new(),
             id_to_idx: std::collections::HashMap::new(),
+            deleted: std::collections::HashSet::new(),
         }
     }
 
     pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<()> {
         let code = self.quantizer.encode(vector)?;
-        let idx = self.ids.len();
-        self.id_to_idx.insert(id, idx);
-        self.ids.push(id);
-        self.codes.push(code);
+        if self.id_to_idx.contains_key(&id) && !self.deleted.contains(&id) {
+            let idx = self.id_to_idx[&id];
+            self.codes[idx] = code;
+            return Ok(());
+        }
+        if self.deleted.remove(&id) {
+            let idx = self.id_to_idx[&id];
+            self.codes[idx] = code;
+        } else {
+            let idx = self.ids.len();
+            self.id_to_idx.insert(id, idx);
+            self.ids.push(id);
+            self.codes.push(code);
+        }
         Ok(())
+    }
+
+    pub fn delete(&mut self, id: u64) -> bool {
+        if self.id_to_idx.contains_key(&id) && !self.deleted.contains(&id) {
+            self.deleted.insert(id);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn search_adc(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
@@ -323,6 +345,9 @@ impl QuantizedVectorStorage {
 
         for (idx, code) in self.codes.iter().enumerate() {
             let id = self.ids[idx];
+            if self.deleted.contains(&id) {
+                continue;
+            }
             let dist = self.quantizer.distance_adc(&lut, code);
 
             let cand = Candidate { id, distance: dist };

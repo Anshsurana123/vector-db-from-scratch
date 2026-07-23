@@ -73,7 +73,7 @@ impl Ord for MaxCandidate {
 #[derive(Debug)]
 pub struct ConcurrentHnswNode {
     pub id: u64,
-    pub storage_idx: usize,
+    pub storage_idx: AtomicUsize,
     pub level: usize,
     pub neighbors: Vec<RwLock<Vec<usize>>>,
 }
@@ -104,6 +104,17 @@ impl ConcurrentHnswIndex {
             has_entry_point: std::sync::atomic::AtomicBool::new(false),
             visited_tags: Mutex::new(Vec::new()),
             visit_id_counter: AtomicU32::new(1),
+        }
+    }
+
+    pub fn remap_storage_indices(&self, map: &std::collections::HashMap<u64, usize>) {
+        let nodes = self.nodes.read();
+        for node in nodes.iter() {
+            if let Some(&new_idx) = map.get(&node.id) {
+                node.storage_idx.store(new_idx, AtomicOrdering::Relaxed);
+            } else {
+                node.storage_idx.store(usize::MAX, AtomicOrdering::Relaxed);
+            }
         }
     }
 
@@ -146,12 +157,18 @@ impl ConcurrentHnswIndex {
                 visited[node_idx] = visit_id;
             }
             if node_idx < nodes.len() {
-                let st_idx = nodes[node_idx].storage_idx;
-                if let Some(vec) = storage.get_vector_by_idx(st_idx) {
-                    let dist = compute_distance(self.metric, query, vec);
-                    let cand = Candidate { idx: node_idx, distance: dist };
-                    min_candidates.push(MinCandidate(cand));
-                    max_results.push(MaxCandidate(cand));
+                let st_idx = nodes[node_idx].storage_idx.load(AtomicOrdering::Relaxed);
+                if st_idx != usize::MAX {
+                    if let Some(vec) = storage.get_vector_by_idx(st_idx) {
+                        let dist = compute_distance(self.metric, query, vec);
+                        let cand = Candidate { idx: node_idx, distance: dist };
+                        min_candidates.push(MinCandidate(cand));
+                        max_results.push(MaxCandidate(cand));
+                    } else {
+                        min_candidates.push(MinCandidate(Candidate { idx: node_idx, distance: 0.0 }));
+                    }
+                } else {
+                    min_candidates.push(MinCandidate(Candidate { idx: node_idx, distance: 0.0 }));
                 }
             }
         }
@@ -171,20 +188,26 @@ impl ConcurrentHnswIndex {
                             visited[nbr_idx] = visit_id;
 
                             if nbr_idx < nodes.len() {
-                                let nbr_st_idx = nodes[nbr_idx].storage_idx;
-                                if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_st_idx) {
-                                    let dist = compute_distance(self.metric, query, nbr_vec);
-                                    let cand = Candidate { idx: nbr_idx, distance: dist };
-                                    let worst_dist = max_results.peek().map(|m| m.0.distance).unwrap_or(f32::MAX);
+                                let nbr_st_idx = nodes[nbr_idx].storage_idx.load(AtomicOrdering::Relaxed);
+                                if nbr_st_idx != usize::MAX {
+                                    if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_st_idx) {
+                                        let dist = compute_distance(self.metric, query, nbr_vec);
+                                        let cand = Candidate { idx: nbr_idx, distance: dist };
+                                        let worst_dist = max_results.peek().map(|m| m.0.distance).unwrap_or(f32::MAX);
 
-                                    if dist < worst_dist || max_results.len() < ef {
-                                        min_candidates.push(MinCandidate(cand));
-                                        max_results.push(MaxCandidate(cand));
+                                        if dist < worst_dist || max_results.len() < ef {
+                                            min_candidates.push(MinCandidate(cand));
+                                            max_results.push(MaxCandidate(cand));
 
-                                        if max_results.len() > ef {
-                                            max_results.pop();
+                                            if max_results.len() > ef {
+                                                max_results.pop();
+                                            }
                                         }
+                                    } else {
+                                        min_candidates.push(MinCandidate(Candidate { idx: nbr_idx, distance: 0.0 }));
                                     }
+                                } else {
+                                    min_candidates.push(MinCandidate(Candidate { idx: nbr_idx, distance: 0.0 }));
                                 }
                             }
                         }
@@ -228,7 +251,7 @@ impl ConcurrentHnswIndex {
                 .into_iter()
                 .filter_map(|idx| {
                     if idx < snapshot_nodes.len() {
-                        let st_idx = snapshot_nodes[idx].storage_idx;
+                        let st_idx = snapshot_nodes[idx].storage_idx.load(AtomicOrdering::Relaxed);
                         storage.get_vector_by_idx(st_idx).map(|v| Candidate {
                             idx,
                             distance: compute_distance(self.metric, query, v),
@@ -253,7 +276,7 @@ impl ConcurrentHnswIndex {
             if e.idx >= snapshot_nodes.len() {
                 continue;
             }
-            let e_st_idx = snapshot_nodes[e.idx].storage_idx;
+            let e_st_idx = snapshot_nodes[e.idx].storage_idx.load(AtomicOrdering::Relaxed);
             let e_vec = match storage.get_vector_by_idx(e_st_idx) {
                 Some(v) => v,
                 None => continue,
@@ -300,7 +323,7 @@ impl ConcurrentHnswIndex {
 
         let new_node = std::sync::Arc::new(ConcurrentHnswNode {
             id,
-            storage_idx,
+            storage_idx: AtomicUsize::new(storage_idx),
             level: target_level,
             neighbors,
         });
@@ -365,13 +388,13 @@ impl ConcurrentHnswIndex {
                     nbr_neighbors.push(q_node_idx);
 
                     if nbr_neighbors.len() > m_max {
-                        let nbr_st_idx = snapshot_nodes[nbr_idx].storage_idx;
+                        let nbr_st_idx = snapshot_nodes[nbr_idx].storage_idx.load(AtomicOrdering::Relaxed);
                         if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_st_idx) {
                             let existing_cand: Vec<Candidate> = nbr_neighbors
                                 .iter()
                                 .filter_map(|&c_idx| {
                                     if c_idx < snapshot_nodes.len() {
-                                        let c_st_idx = snapshot_nodes[c_idx].storage_idx;
+                                        let c_st_idx = snapshot_nodes[c_idx].storage_idx.load(AtomicOrdering::Relaxed);
                                         storage.get_vector_by_idx(c_st_idx).map(|v| Candidate {
                                             idx: c_idx,
                                             distance: compute_distance(self.metric, nbr_vec, v),
@@ -551,7 +574,7 @@ impl Serialize for ConcurrentHnswIndex {
         let nodes = self.nodes.read().iter().map(|n| {
             ConcurrentHnswNodeSurrogate {
                 id: n.id,
-                storage_idx: n.storage_idx,
+                storage_idx: n.storage_idx.load(AtomicOrdering::Relaxed),
                 level: n.level,
                 neighbors: n.neighbors.iter().map(|l| l.read().clone()).collect(),
             }
@@ -578,7 +601,7 @@ impl<'de> Deserialize<'de> for ConcurrentHnswIndex {
         let nodes = surrogate.nodes.into_iter().map(|n| {
             std::sync::Arc::new(ConcurrentHnswNode {
                 id: n.id,
-                storage_idx: n.storage_idx,
+                storage_idx: AtomicUsize::new(n.storage_idx),
                 level: n.level,
                 neighbors: n.neighbors.into_iter().map(|l| RwLock::new(l)).collect(),
             })
@@ -602,7 +625,7 @@ impl Clone for ConcurrentHnswIndex {
         let nodes = self.nodes.read().iter().map(|n| {
             std::sync::Arc::new(ConcurrentHnswNode {
                 id: n.id,
-                storage_idx: n.storage_idx,
+                storage_idx: AtomicUsize::new(n.storage_idx.load(AtomicOrdering::Relaxed)),
                 level: n.level,
                 neighbors: n.neighbors.iter().map(|l| RwLock::new(l.read().clone())).collect(),
             })

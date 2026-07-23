@@ -77,17 +77,50 @@ impl QueryPlanner {
     }
 }
 
+const MAX_SAMPLE_SIZE: usize = 1000;
+
 fn filter_matching_count(storage: &VectorStorage, filter: &FilterExpression) -> usize {
-    let mut count = 0;
-    for &id in storage.raw_idx_to_id() {
-        if storage.is_deleted(id) {
-            continue;
+    let raw_ids = storage.raw_idx_to_id();
+    let total_raw = raw_ids.len();
+    if total_raw == 0 {
+        return 0;
+    }
+
+    if total_raw <= MAX_SAMPLE_SIZE {
+        let mut count = 0;
+        for &id in raw_ids {
+            if storage.is_deleted(id) {
+                continue;
+            }
+            if filter.matches_id(storage, id) {
+                count += 1;
+            }
         }
-        if filter.matches_id(storage, id) {
-            count += 1;
+        count
+    } else {
+        let step = (total_raw / MAX_SAMPLE_SIZE).max(1);
+        let mut sampled_total = 0;
+        let mut sampled_matches = 0;
+
+        for i in (0..total_raw).step_by(step) {
+            let id = raw_ids[i];
+            if storage.is_deleted(id) {
+                continue;
+            }
+            sampled_total += 1;
+            if filter.matches_id(storage, id) {
+                sampled_matches += 1;
+            }
+        }
+
+        if sampled_total == 0 {
+            0
+        } else {
+            let total_live = storage.len();
+            let estimated = (sampled_matches as f64 / sampled_total as f64 * total_live as f64).round() as usize;
+            estimated.min(total_live)
         }
     }
-    count
 }
 
 #[cfg(test)]
@@ -116,5 +149,24 @@ mod tests {
         let plan_broad = QueryPlanner::plan(&storage, Some(&broad_filter), 10);
         assert_eq!(plan_broad.strategy, QueryStrategy::HnswFiltered);
         assert_eq!(plan_broad.matching_count, 80);
+    }
+
+    #[test]
+    fn test_query_planner_large_dataset_sampling() {
+        let mut storage = VectorStorage::new(2);
+        // Insert 10,000 vectors with 5% matching val < 500
+        for i in 0..10000 {
+            storage.insert(
+                i as u64,
+                &[i as f32, i as f32],
+                Some(serde_json::json!({"val": i})),
+            ).unwrap();
+        }
+
+        let selective_filter = FilterExpression::Lt("val".into(), 500.0);
+        let plan = QueryPlanner::plan(&storage, Some(&selective_filter), 10);
+        // Should select FilteredScan since selectivity ~ 5% (< 10%)
+        assert_eq!(plan.strategy, QueryStrategy::FilteredScan);
+        assert!(plan.matching_count > 400 && plan.matching_count < 600);
     }
 }

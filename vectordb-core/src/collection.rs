@@ -106,6 +106,10 @@ impl Collection {
             }
         }
 
+        if let Some(pq) = self.pq.write().as_mut() {
+            let _ = pq.insert(id, vector);
+        }
+
         Ok(())
     }
 
@@ -198,7 +202,16 @@ fn filtered_brute_force(
 
     pub fn delete(&self, id: u64) -> Result<bool> {
         let mut storage = self.storage.write();
-        storage.delete(id)
+        let deleted = storage.delete(id)?;
+        drop(storage);
+
+        if deleted {
+            if let Some(pq) = self.pq.write().as_mut() {
+                pq.delete(id);
+            }
+        }
+
+        Ok(deleted)
     }
 
     pub fn get_vector(&self, id: u64) -> Option<Vec<f32>> {
@@ -217,7 +230,18 @@ fn filtered_brute_force(
 
     pub fn compact(&self) {
         let mut storage = self.storage.write();
-        storage.compact();
+        let remapped = storage.compact();
+        drop(storage);
+
+        match &self.index {
+            IndexWrapper::Standard(hnsw) => {
+                let mut hnsw = hnsw.write();
+                hnsw.remap_storage_indices(&remapped);
+            }
+            IndexWrapper::Concurrent(concurrent_hnsw) => {
+                concurrent_hnsw.remap_storage_indices(&remapped);
+            }
+        }
     }
 
     pub fn enable_pq(&self, num_subvectors: usize) -> Result<()> {

@@ -238,7 +238,7 @@ impl VectorStorage {
         &self.idx_to_id
     }
 
-    pub fn compact(&mut self) {
+    pub fn compact(&mut self) -> HashMap<u64, usize> {
         let dim = self.dim;
         let mut new_data = Vec::with_capacity((self.idx_to_id.len() - self.deleted.len()) * dim);
         let mut new_idx_to_id = Vec::with_capacity(self.idx_to_id.len() - self.deleted.len());
@@ -256,8 +256,10 @@ impl VectorStorage {
 
         self.data = new_data;
         self.idx_to_id = new_idx_to_id;
-        self.id_to_idx = new_id_to_idx;
+        self.id_to_idx = new_id_to_idx.clone();
         self.deleted.clear();
+
+        new_id_to_idx
     }
 }
 

@@ -120,3 +120,83 @@ fn test_flaw_7_query_planner_routing() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_phase0_compaction_middle_delete() -> Result<()> {
+    let db = VectorDb::new();
+    let col = db.create_collection_with_config(
+        "middle_delete_col",
+        2,
+        MetricType::L2,
+        HnswConfig::new(4, 16, 16),
+    )?;
+
+    // Insert 10 vectors (IDs 10 to 19)
+    for i in 0..10 {
+        let id = 10 + i;
+        col.insert(id, &[id as f32, id as f32], None)?;
+    }
+
+    // Delete middle ID 14 (leaving a physical gap in storage when compacting)
+    col.delete(14)?;
+    assert_eq!(col.len(), 9);
+
+    // Compact collection - causes storage slice index shifts
+    col.compact();
+    assert_eq!(col.len(), 9);
+
+    // Verify HNSW search works correctly without out-of-bounds panics or corrupted vector slice references
+    let res = col.search_hnsw(&[19.0, 19.0], 1, 16)?;
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].id, 19);
+
+    let res_low = col.search_hnsw(&[10.0, 10.0], 1, 16)?;
+    assert_eq!(res_low.len(), 1);
+    assert_eq!(res_low[0].id, 10);
+
+    // Ensure deleted ID 14 is never returned
+    let res_all = col.search_hnsw(&[14.0, 14.0], 10, 16)?;
+    for r in res_all {
+        assert_ne!(r.id, 14);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_phase0_pq_ingestion_and_deletion_drift() -> Result<()> {
+    let db = VectorDb::new();
+    let col = db.create_collection("pq_drift_col", 4, MetricType::L2)?;
+
+    // Insert 20 initial vectors
+    for i in 0..20 {
+        col.insert(i, &[i as f32, (i * 2) as f32, 0.0, 0.0], None)?;
+    }
+
+    // Train PQ
+    col.enable_pq(2)?;
+
+    // Insert 5 MORE vectors after PQ is trained
+    for i in 20..25 {
+        col.insert(i, &[i as f32, (i * 2) as f32, 0.0, 0.0], None)?;
+    }
+
+    // Delete ID 5
+    col.delete(5)?;
+
+    // Perform PQ search
+    let results = col.search_pq(&[24.0, 48.0, 0.0, 0.0], 10, 16)?;
+    assert!(!results.is_empty());
+
+    // Verify post-train vector ID 24 is reachable in PQ search
+    let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+    assert!(ids.contains(&24), "Post-train inserted vector 24 must be present in PQ search");
+
+    // Verify deleted ID 5 is excluded from PQ search
+    let all_pq = col.search_pq(&[5.0, 10.0, 0.0, 0.0], 25, 16)?;
+    for r in all_pq {
+        assert_ne!(r.id, 5, "Deleted vector ID 5 must never be returned by search_pq");
+    }
+
+    Ok(())
+}
+

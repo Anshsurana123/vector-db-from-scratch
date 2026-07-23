@@ -219,6 +219,7 @@ impl Ord for MaxCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswNode {
     pub id: u64,
+    pub storage_idx: usize,
     pub level: usize,
     pub neighbors: Vec<Vec<usize>>,
 }
@@ -307,20 +308,27 @@ impl HnswIndex {
             if node_idx < visited.len() {
                 visited[node_idx] = visit_id;
             }
-            if let Some(vec) = storage.get_vector_by_idx(node_idx) {
-                let node_id = self.nodes[node_idx].id;
-                let matches_filter = match filter {
-                    Some(f) => f.matches_id(storage, node_id),
-                    None => true,
-                };
+            let st_idx = self.nodes[node_idx].storage_idx;
+            if st_idx != usize::MAX {
+                if let Some(vec) = storage.get_vector_by_idx(st_idx) {
+                    let node_id = self.nodes[node_idx].id;
+                    let matches_filter = match filter {
+                        Some(f) => f.matches_id(storage, node_id),
+                        None => true,
+                    };
 
-                let dist = compute_distance(self.metric, query, vec);
-                let cand = Candidate { idx: node_idx, distance: dist };
-                min_candidates.push(MinCandidate(cand));
+                    let dist = compute_distance(self.metric, query, vec);
+                    let cand = Candidate { idx: node_idx, distance: dist };
+                    min_candidates.push(MinCandidate(cand));
 
-                if matches_filter {
-                    max_results.push(MaxCandidate(cand));
+                    if matches_filter {
+                        max_results.push(MaxCandidate(cand));
+                    }
+                } else {
+                    min_candidates.push(MinCandidate(Candidate { idx: node_idx, distance: 0.0 }));
                 }
+            } else {
+                min_candidates.push(MinCandidate(Candidate { idx: node_idx, distance: 0.0 }));
             }
         }
 
@@ -336,26 +344,33 @@ impl HnswIndex {
                     if nbr_idx < visited.len() && visited[nbr_idx] != visit_id {
                         visited[nbr_idx] = visit_id;
 
-                        if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_idx) {
-                            let nbr_id = self.nodes[nbr_idx].id;
-                            let matches_filter = match filter {
-                                Some(f) => f.matches_id(storage, nbr_id),
-                                None => true,
-                            };
+                        let nbr_st_idx = self.nodes[nbr_idx].storage_idx;
+                        if nbr_st_idx != usize::MAX {
+                            if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_st_idx) {
+                                let nbr_id = self.nodes[nbr_idx].id;
+                                let matches_filter = match filter {
+                                    Some(f) => f.matches_id(storage, nbr_id),
+                                    None => true,
+                                };
 
-                            let dist = compute_distance(self.metric, query, nbr_vec);
-                            let cand = Candidate { idx: nbr_idx, distance: dist };
-                            let worst_dist = max_results.peek().map(|m| m.0.distance).unwrap_or(f32::MAX);
+                                let dist = compute_distance(self.metric, query, nbr_vec);
+                                let cand = Candidate { idx: nbr_idx, distance: dist };
+                                let worst_dist = max_results.peek().map(|m| m.0.distance).unwrap_or(f32::MAX);
 
-                            min_candidates.push(MinCandidate(cand));
+                                min_candidates.push(MinCandidate(cand));
 
-                            if matches_filter && (dist < worst_dist || max_results.len() < ef) {
-                                max_results.push(MaxCandidate(cand));
+                                if matches_filter && (dist < worst_dist || max_results.len() < ef) {
+                                    max_results.push(MaxCandidate(cand));
 
-                                if max_results.len() > ef {
-                                    max_results.pop();
+                                    if max_results.len() > ef {
+                                        max_results.pop();
+                                    }
                                 }
+                            } else {
+                                min_candidates.push(MinCandidate(Candidate { idx: nbr_idx, distance: 0.0 }));
                             }
+                        } else {
+                            min_candidates.push(MinCandidate(Candidate { idx: nbr_idx, distance: 0.0 }));
                         }
                     }
                 }
@@ -392,7 +407,7 @@ impl HnswIndex {
             w_candidates = extended
                 .into_iter()
                 .filter_map(|idx| {
-                    storage.get_vector_by_idx(idx).map(|v| Candidate {
+                    storage.get_vector_by_idx(self.nodes[idx].storage_idx).map(|v| Candidate {
                         idx,
                         distance: compute_distance(self.metric, query, v),
                     })
@@ -410,7 +425,7 @@ impl HnswIndex {
                 break;
             }
 
-            let e_vec = match storage.get_vector_by_idx(e.idx) {
+            let e_vec = match storage.get_vector_by_idx(self.nodes[e.idx].storage_idx) {
                 Some(v) => v,
                 None => continue,
             };
@@ -443,6 +458,16 @@ impl HnswIndex {
         result_indices
     }
 
+    pub fn remap_storage_indices(&mut self, map: &std::collections::HashMap<u64, usize>) {
+        for node in &mut self.nodes {
+            if let Some(&new_idx) = map.get(&node.id) {
+                node.storage_idx = new_idx;
+            } else {
+                node.storage_idx = usize::MAX;
+            }
+        }
+    }
+
     /// Insert a vector into the HNSW index
     pub fn insert(&mut self, id: u64, storage: &VectorStorage) -> Result<()> {
         let node_idx = storage.get_idx_by_id(id).ok_or(VectorDbError::VectorNotFound(id))?;
@@ -456,6 +481,7 @@ impl HnswIndex {
 
         let new_node = HnswNode {
             id,
+            storage_idx: node_idx,
             level: target_level,
             neighbors,
         };
@@ -513,7 +539,7 @@ impl HnswIndex {
                 self.nodes[nbr_idx].neighbors[lc].push(q_node_idx);
 
                 if self.nodes[nbr_idx].neighbors[lc].len() > m_max {
-                    let nbr_vec = match storage.get_vector_by_idx(nbr_idx) {
+                    let nbr_vec = match storage.get_vector_by_idx(self.nodes[nbr_idx].storage_idx) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -521,7 +547,7 @@ impl HnswIndex {
                     let existing_cand: Vec<Candidate> = self.nodes[nbr_idx].neighbors[lc]
                         .iter()
                         .filter_map(|&c_idx| {
-                            storage.get_vector_by_idx(c_idx).map(|v| Candidate {
+                            storage.get_vector_by_idx(self.nodes[c_idx].storage_idx).map(|v| Candidate {
                                 idx: c_idx,
                                 distance: compute_distance(self.metric, nbr_vec, v),
                             })
