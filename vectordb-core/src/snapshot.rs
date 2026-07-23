@@ -104,6 +104,7 @@ mod tests {
                 hnsw,
                 use_concurrent_index: false,
                 concurrent_hnsw: crate::concurrent_hnsw::ConcurrentHnswIndex::new(HnswConfig::default(), MetricType::L2),
+                pq_storage: None,
             }],
         };
 

@@ -7,12 +7,10 @@ use parking_lot::{Mutex, RwLock};
 use crate::distance::MetricType;
 use crate::error::{Result, VectorDbError};
 use crate::filter::FilterExpression;
-use crate::hnsw::{HnswConfig, HnswIndex};
+use crate::hnsw::HnswConfig;
 use crate::snapshot::{CollectionSnapshotData, DbSnapshotData, SnapshotEngine};
 use crate::storage::{SearchResult, VectorStorage};
 use crate::wal::{WalOp, WalReader, WalWriter};
-
-#[derive(Debug)]
 
 #[derive(Debug)]
 pub enum IndexWrapper {
@@ -29,6 +27,7 @@ pub struct Collection {
     pub use_concurrent_index: bool,
     storage: std::sync::Arc<RwLock<VectorStorage>>,
     index: IndexWrapper,
+    pq: RwLock<Option<crate::pq::QuantizedVectorStorage>>,
 }
 
 impl Collection {
@@ -66,6 +65,7 @@ impl Collection {
             use_concurrent_index,
             storage: std::sync::Arc::new(RwLock::new(VectorStorage::new(dim))),
             index,
+            pq: RwLock::new(None),
         }
     }
 
@@ -127,6 +127,28 @@ impl Collection {
         }
     }
 
+fn filtered_brute_force(
+    storage: &VectorStorage,
+    query: &[f32],
+    k: usize,
+    metric: MetricType,
+    filter: &FilterExpression,
+) -> Result<Vec<SearchResult>> {
+    let all_bf = storage.search_brute_force(query, storage.len(), metric)?;
+    let results: Vec<SearchResult> = all_bf
+        .into_iter()
+        .filter(|r| {
+            if let Some(meta) = &r.metadata {
+                filter.matches(meta)
+            } else {
+                false
+            }
+        })
+        .take(k)
+        .collect();
+    Ok(results)
+}
+
     pub fn search_with_filter(
         &self,
         query: &[f32],
@@ -134,9 +156,36 @@ impl Collection {
         filter: &FilterExpression,
     ) -> Result<Vec<SearchResult>> {
         let storage = self.storage.read();
-        let hnsw = self.hnsw.read();
-        let ef_search = hnsw.config.ef_search;
-        hnsw.search_with_filter(query, k, ef_search, &storage, Some(filter))
+        let plan = crate::planner::QueryPlanner::plan(&storage, Some(filter), k);
+        tracing::info!(
+            strategy = ?plan.strategy,
+            selectivity = plan.selectivity,
+            matching = plan.matching_count,
+            total = plan.total_count,
+            "{}", plan.rationale
+        );
+
+        match plan.strategy {
+            crate::planner::QueryStrategy::BruteForceScan => {
+                storage.search_brute_force(query, k, self.metric)
+            }
+            crate::planner::QueryStrategy::FilteredScan => {
+                Self::filtered_brute_force(&storage, query, k, self.metric, filter)
+            }
+            crate::planner::QueryStrategy::HnswFiltered => {
+                match &self.index {
+                    IndexWrapper::Standard(hnsw) => {
+                        let hnsw = hnsw.read();
+                        let ef_search = hnsw.config.ef_search;
+                        hnsw.search_with_filter(query, k, ef_search, &storage, Some(filter))
+                    }
+                    IndexWrapper::Concurrent(concurrent_hnsw) => {
+                        let ef_search = concurrent_hnsw.config.ef_search;
+                        concurrent_hnsw.search_with_filter(query, k, ef_search, &storage, Some(filter))
+                    }
+                }
+            }
+        }
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
@@ -164,6 +213,55 @@ impl Collection {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn compact(&self) {
+        let mut storage = self.storage.write();
+        storage.compact();
+    }
+
+    pub fn enable_pq(&self, num_subvectors: usize) -> Result<()> {
+        if self.len() == 0 {
+            return Ok(());
+        }
+        self.train_pq(num_subvectors)
+    }
+
+    pub fn train_pq(&self, num_subvectors: usize) -> Result<()> {
+        let storage = self.storage.read();
+        let vecs: Vec<&[f32]> = storage
+            .raw_idx_to_id()
+            .iter()
+            .filter(|&&id| !storage.is_deleted(id))
+            .filter_map(|&id| storage.get_vector(id))
+            .collect();
+
+        if vecs.is_empty() {
+            return Ok(());
+        }
+
+        let quantizer = crate::pq::ProductQuantizer::train(&vecs, storage.dim(), num_subvectors, 256, 25, self.metric)?;
+        let mut pq_storage = crate::pq::QuantizedVectorStorage::new(quantizer);
+
+        for &id in storage.raw_idx_to_id() {
+            if storage.is_deleted(id) {
+                continue;
+            }
+            if let Some(v) = storage.get_vector(id) {
+                pq_storage.insert(id, v)?;
+            }
+        }
+
+        *self.pq.write() = Some(pq_storage);
+        Ok(())
+    }
+
+    pub fn search_pq(&self, query: &[f32], k: usize, _ef_search: usize) -> Result<Vec<SearchResult>> {
+        let pq_guard = self.pq.read();
+        let pq_storage = pq_guard
+            .as_ref()
+            .ok_or_else(|| VectorDbError::StorageError("PQ not trained for this collection".into()))?;
+        pq_storage.search_adc(query, k)
     }
 }
 
@@ -230,6 +328,7 @@ impl VectorDb {
                     use_concurrent_index: col_snap.use_concurrent_index,
                     storage: std::sync::Arc::new(RwLock::new(col_snap.storage)),
                     index,
+                    pq: RwLock::new(col_snap.pq_storage),
                 });
                 collections_guard.insert(col_snap.name, collection);
             }
@@ -365,9 +464,15 @@ impl VectorDb {
     }
 
     pub fn save_snapshot(&self) -> Result<PathBuf> {
-        let dir = self.db_dir.as_ref().ok_or_else(|| {
-            VectorDbError::StorageError("Cannot save snapshot for in-memory VectorDb without db_dir".into())
-        })?;
+        let dir_buf;
+        let dir = match &self.db_dir {
+            Some(d) => d.as_path(),
+            None => {
+                dir_buf = PathBuf::from("./snapshots");
+                std::fs::create_dir_all(&dir_buf)?;
+                dir_buf.as_path()
+            }
+        };
 
         let current_seq = self.last_seq.load(Ordering::SeqCst);
         let collections_guard = self.collections.read();
@@ -381,14 +486,7 @@ impl VectorDb {
                     (h.read().clone(), crate::concurrent_hnsw::ConcurrentHnswIndex::new(col.config.clone(), col.metric))
                 }
                 IndexWrapper::Concurrent(c) => {
-                    // Serialize surrogate for concurrent_hnsw by cloning node by node. Actually we can just clone the structure via a surrogate locally.
-                    // For now, bincode serialization doesn't require Clone, but our CollectionSnapshotData needs to own it.
-                    // Oh wait! We didn't implement Clone for ConcurrentHnswIndex. Let's just create a new empty one if we can't clone, or serialize it.
-                    // Actually, if we just deserialize to a new one, we can use the original if we implemented Clone.
-                    // Let's assume ConcurrentHnswIndex is NOT easily clonable. So we will skip cloning if not implemented, or we implement Clone in concurrent_hnsw.rs.
-                    // Let's implement Clone for ConcurrentHnswIndex later.
-                    (crate::hnsw::HnswIndex::new(col.config.clone(), col.metric), crate::concurrent_hnsw::ConcurrentHnswIndex::new(col.config.clone(), col.metric)) 
-                    // To truly save snapshot we need to clone the concurrent_hnsw! I will add Clone to ConcurrentHnswIndex manually.
+                    (crate::hnsw::HnswIndex::new(col.config.clone(), col.metric), c.as_ref().clone())
                 }
             };
 
@@ -401,6 +499,7 @@ impl VectorDb {
                 storage,
                 hnsw,
                 concurrent_hnsw,
+                pq_storage: col.pq.read().clone(),
             });
         }
 
@@ -409,7 +508,14 @@ impl VectorDb {
             collections: col_snapshots,
         };
 
-        SnapshotEngine::save_snapshot_atomic(dir, &db_snap)
+        let snap_path = SnapshotEngine::save_snapshot_atomic(dir, &db_snap)?;
+
+        let mut wal_guard = self.wal_writer.lock();
+        if let Some(writer) = wal_guard.as_mut() {
+            writer.truncate()?;
+        }
+
+        Ok(snap_path)
     }
 
     pub fn get_collection(&self, name: &str) -> Result<Arc<Collection>> {
@@ -425,7 +531,32 @@ impl VectorDb {
         Ok(collections.remove(name).is_some())
     }
 
-    #[cfg(test)]
+    pub fn list_collections(&self) -> Vec<String> {
+        let collections = self.collections.read();
+        collections.keys().cloned().collect()
+    }
+
+    pub fn compact_collection(&self, name: &str) -> Result<()> {
+        let col = self.get_collection(name)?;
+        col.compact();
+        Ok(())
+    }
+
+    pub fn enable_pq(&self, name: &str, num_subvectors: usize) -> Result<()> {
+        let col = self.get_collection(name)?;
+        col.enable_pq(num_subvectors)
+    }
+
+    pub fn train_pq(&self, name: &str, num_subvectors: usize) -> Result<()> {
+        let col = self.get_collection(name)?;
+        col.train_pq(num_subvectors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn test_concurrent_collection() -> Result<()> {
         use std::sync::Arc;

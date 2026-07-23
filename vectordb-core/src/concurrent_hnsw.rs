@@ -196,6 +196,97 @@ impl ConcurrentHnswIndex {
         (max_results, ep.len())
     }
 
+    /// Algorithm 4: Heuristic Neighbor Selection (Malikov & Yashunin) for Concurrent Graph
+    fn select_neighbors_heuristic(
+        &self,
+        query: &[f32],
+        candidates: Vec<Candidate>,
+        m: usize,
+        lc: usize,
+        storage: &VectorStorage,
+        snapshot_nodes: &[std::sync::Arc<ConcurrentHnswNode>],
+    ) -> Vec<usize> {
+        let mut w_candidates = candidates;
+        w_candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+
+        if self.config.extend_candidates {
+            let mut extended = std::collections::HashSet::new();
+            for cand in &w_candidates {
+                extended.insert(cand.idx);
+                if cand.idx < snapshot_nodes.len() {
+                    let node = &snapshot_nodes[cand.idx];
+                    if lc < node.neighbors.len() {
+                        let nbrs = node.neighbors[lc].read();
+                        for &nbr_idx in nbrs.iter() {
+                            extended.insert(nbr_idx);
+                        }
+                    }
+                }
+            }
+
+            w_candidates = extended
+                .into_iter()
+                .filter_map(|idx| {
+                    if idx < snapshot_nodes.len() {
+                        let st_idx = snapshot_nodes[idx].storage_idx;
+                        storage.get_vector_by_idx(st_idx).map(|v| Candidate {
+                            idx,
+                            distance: compute_distance(self.metric, query, v),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            w_candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        }
+
+        let mut result_indices: Vec<usize> = Vec::with_capacity(m);
+        let mut result_vectors: Vec<&[f32]> = Vec::with_capacity(m);
+        let mut discarded = Vec::new();
+
+        for e in w_candidates {
+            if result_indices.len() >= m {
+                break;
+            }
+
+            if e.idx >= snapshot_nodes.len() {
+                continue;
+            }
+            let e_st_idx = snapshot_nodes[e.idx].storage_idx;
+            let e_vec = match storage.get_vector_by_idx(e_st_idx) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let metric = self.metric;
+            let e_dist = e.distance;
+            let is_closer = result_vectors
+                .iter()
+                .all(|&r_vec| compute_distance(metric, e_vec, r_vec) > e_dist);
+
+            if is_closer {
+                result_indices.push(e.idx);
+                result_vectors.push(e_vec);
+            } else {
+                discarded.push(e.idx);
+            }
+        }
+
+        if self.config.keep_pruned_connections && result_indices.len() < m {
+            for idx in discarded {
+                if result_indices.len() >= m {
+                    break;
+                }
+                if !result_indices.contains(&idx) {
+                    result_indices.push(idx);
+                }
+            }
+        }
+
+        result_indices
+    }
+
     /// Insert vector into the concurrent HNSW index with fine-grained neighbor locks
     pub fn insert(&self, id: u64, storage: &VectorStorage) -> Result<()> {
         let storage_idx = storage.get_idx_by_id(id).ok_or(VectorDbError::VectorNotFound(id))?;
@@ -257,12 +348,52 @@ impl ConcurrentHnswIndex {
             let candidates_vec: Vec<Candidate> = candidates_heap.into_vec().into_iter().map(|m| m.0).collect();
             let m_max = if lc == 0 { self.config.m_max0 } else { self.config.m };
 
-            // Connect neighbors using fine-grained RwLock
-            for cand in candidates_vec.iter().take(m_max) {
-                let nbr_idx = cand.idx;
+            let selected_nbrs = self.select_neighbors_heuristic(
+                q_vec,
+                candidates_vec.clone(),
+                m_max,
+                lc,
+                storage,
+                &snapshot_nodes,
+            );
+
+            for &nbr_idx in &selected_nbrs {
                 if nbr_idx < snapshot_nodes.len() && nbr_idx != q_node_idx {
                     new_node.neighbors[lc].write().push(nbr_idx);
-                    snapshot_nodes[nbr_idx].neighbors[lc].write().push(q_node_idx);
+                    
+                    let mut nbr_neighbors = snapshot_nodes[nbr_idx].neighbors[lc].write();
+                    nbr_neighbors.push(q_node_idx);
+
+                    if nbr_neighbors.len() > m_max {
+                        let nbr_st_idx = snapshot_nodes[nbr_idx].storage_idx;
+                        if let Some(nbr_vec) = storage.get_vector_by_idx(nbr_st_idx) {
+                            let existing_cand: Vec<Candidate> = nbr_neighbors
+                                .iter()
+                                .filter_map(|&c_idx| {
+                                    if c_idx < snapshot_nodes.len() {
+                                        let c_st_idx = snapshot_nodes[c_idx].storage_idx;
+                                        storage.get_vector_by_idx(c_st_idx).map(|v| Candidate {
+                                            idx: c_idx,
+                                            distance: compute_distance(self.metric, nbr_vec, v),
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            let pruned = self.select_neighbors_heuristic(
+                                nbr_vec,
+                                existing_cand,
+                                m_max,
+                                lc,
+                                storage,
+                                &snapshot_nodes,
+                            );
+
+                            *nbr_neighbors = pruned;
+                        }
+                    }
                 }
             }
 
@@ -293,6 +424,17 @@ impl ConcurrentHnswIndex {
         ef_search: usize,
         storage: &VectorStorage,
     ) -> Result<Vec<SearchResult>> {
+        self.search_with_filter(query, k, ef_search, storage, None)
+    }
+
+    pub fn search_with_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        storage: &VectorStorage,
+        filter: Option<&crate::filter::FilterExpression>,
+    ) -> Result<Vec<SearchResult>> {
         if k == 0 || !self.has_entry_point.load(AtomicOrdering::Relaxed) {
             return Ok(Vec::new());
         }
@@ -322,12 +464,36 @@ impl ConcurrentHnswIndex {
             .filter(|c| {
                 if c.idx < snapshot_nodes.len() {
                     let id = snapshot_nodes[c.idx].id;
-                    !storage.is_deleted(id)
+                    if storage.is_deleted(id) {
+                        return false;
+                    }
+                    if let Some(f) = filter {
+                        f.matches_id(storage, id)
+                    } else {
+                        true
+                    }
                 } else {
                     false
                 }
             })
             .collect();
+
+        if filter.is_some() && sorted_cands.len() < k {
+            let all_bf = storage.search_brute_force(query, storage.len(), self.metric)?;
+            let f_expr = filter.unwrap();
+            let filtered_results: Vec<SearchResult> = all_bf
+                .into_iter()
+                .filter(|r| {
+                    if let Some(meta) = &r.metadata {
+                        f_expr.matches(meta)
+                    } else {
+                        false
+                    }
+                })
+                .take(k)
+                .collect();
+            return Ok(filtered_results);
+        }
 
         sorted_cands.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
         sorted_cands.truncate(k);

@@ -92,6 +92,22 @@ impl WalWriter {
         Ok(())
     }
 
+    pub fn truncate(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        file.sync_all()?;
+        let app_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)?;
+        self.writer = BufWriter::new(app_file);
+        Ok(())
+    }
+
     pub fn file_path(&self) -> &Path {
         &self.file_path
     }

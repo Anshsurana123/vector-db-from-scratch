@@ -1,8 +1,7 @@
-use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{Result, VectorDbError};
+
 use crate::storage::VectorStorage;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -48,27 +47,7 @@ impl FilterExpression {
         }
     }
 
-    /// Builds a RoaringBitmap containing all matching vector IDs from storage
-    pub fn build_bitmap(&self, storage: &VectorStorage) -> Result<RoaringBitmap> {
-        let mut bitmap = RoaringBitmap::new();
 
-        // Iterate over all active vectors in storage
-        for idx in 0..storage.raw_data().len() / storage.dim() {
-            if let Some(vec) = storage.get_vector_by_idx(idx) {
-                // Find vector ID
-                let id = idx as u64; // Fallback mapping, checked via metadata store
-                if let Some(meta) = storage.get_metadata(id) {
-                    if self.matches(meta) {
-                        if id <= u32::MAX as u64 {
-                            bitmap.insert(id as u32);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(bitmap)
-    }
 
     /// Evaluates bitmap filter against a specific vector ID (u64)
     pub fn matches_id(&self, storage: &VectorStorage, id: u64) -> bool {

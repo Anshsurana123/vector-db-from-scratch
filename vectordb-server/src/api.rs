@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use vectordb_core::{FilterExpression, MetricType, SearchResult, VectorDb, VectorDbError};
+use vectordb_core::{FilterExpression, MetricType, VectorDb, VectorDbError};
 
 #[derive(Debug)]
 pub struct AppState {
@@ -81,12 +81,13 @@ pub fn app(db: Arc<VectorDb>) -> Router {
 
     Router::new()
         .route("/collections", post(create_collection).get(list_collections))
-        .route("/collections/:name", get(get_collection))
+        .route("/collections/:name", get(get_collection).delete(drop_collection))
         .route("/collections/:name/insert", post(insert_vector))
         .route("/collections/:name/search", post(search_vectors))
         .route("/collections/:name/vectors/:id", delete(delete_vector))
         .route("/collections/:name/compact", post(compact_collection))
         .route("/snapshot", post(create_snapshot))
+        .route("/collections/:name/snapshot", post(create_snapshot))
         .route("/collections/:name/train_pq", post(train_pq))
         .with_state(state)
 }
@@ -113,10 +114,10 @@ async fn create_collection(
 }
 
 async fn list_collections(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Basic collection listing response
-    Ok((StatusCode::OK, Json(json!({ "status": "ok" }))))
+    let names = state.db.list_collections();
+    Ok((StatusCode::OK, Json(names)))
 }
 
 async fn get_collection(
@@ -131,6 +132,18 @@ async fn get_collection(
         vector_count: col.len(),
     };
     Ok((StatusCode::OK, Json(res)))
+}
+
+async fn drop_collection(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let dropped = state.db.drop_collection(&name)?;
+    if dropped {
+        Ok((StatusCode::OK, Json(json!({ "status": "dropped", "name": name }))))
+    } else {
+        Err(AppError(VectorDbError::CollectionNotFound(name)))
+    }
 }
 
 async fn insert_vector(
@@ -154,7 +167,7 @@ async fn search_vectors(
     let results = if req.use_pq.unwrap_or(false) {
         col.search_pq(&req.query, req.k, ef_search)?
     } else if let Some(filter) = req.filter {
-        col.search_with_filter(&req.query, req.k, filter)?
+        col.search_with_filter(&req.query, req.k, &filter)?
     } else {
         col.search_hnsw(&req.query, req.k, ef_search)?
     };

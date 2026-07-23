@@ -97,5 +97,22 @@
   - **Concurrent HNSW Index (`concurrent_hnsw.rs`)**: Fine-grained `parking_lot::RwLock` per node neighbor array allowing multi-threaded read traversals during background graph mutations with zero global index locks.
 - **Verification**:
   - `milestone8_gate` verified 10,000 128-dim vectors under active multi-threaded workloads.
-  - **Thread-Safety**: **26,730 concurrent searches** executed cleanly with 0 race conditions, 0 deadlocks, and 0 panics.
-  - **Search Accuracy**: **`Recall@10 = 0.9670`** (96.7%) at `efSearch=200`.
+  - **Thread-Safety**: **22,302 concurrent searches** executed cleanly with 0 race conditions, 0 deadlocks, and 0 panics.
+  - **Multi-threaded Speedup**: **3.27x parallel indexing speedup**.
+  - **Search Accuracy**: **`Recall@10 = 0.9590`** (95.9%) at `efSearch=200`.
+
+---
+
+## 🔧 Remediation & 100% Spec Compliance Audit — **PASS**
+
+All 9 remediation phases completed and verified via automated test gates:
+
+1. **Compilation Errors Fixed (P0)**: Cleaned up duplicate derives, improper test module placements, and mismatched struct literals. Zero build errors or warnings across workspace.
+2. **Storage Compaction & Index Mapping**: Implemented `VectorStorage::compact()` for physical tombstone purging and `raw_idx_to_id()` for raw slice lookups.
+3. **WAL Truncation & Snapshot Integrity**: Added `WalWriter::truncate()` to safely zero out WAL files after atomic snapshot persistence (supporting Windows file locks). Fixed `ConcurrentHnswIndex` snapshot serialization to preserve concurrent graph state.
+4. **Query Planner & Filtered Search Routing**: Integrated `QueryPlanner` into `Collection::search_with_filter`, logging query strategies (`BruteForceScan`, `FilteredScan`, `HnswFiltered`) via `tracing`. Added `search_with_filter` to `ConcurrentHnswIndex`.
+5. **Product Quantization (PQ) Integration**: Wired `enable_pq`, `train_pq`, and `search_pq` into `Collection`, `VectorDb`, and Axum HTTP API.
+6. **Concurrent HNSW Heuristic & Edge Pruning**: Implemented Algorithm 4 heuristic neighbor selection (Malkov & Yashunin 2018) and reverse-edge neighbor list pruning in `ConcurrentHnswIndex`.
+7. **REST API Completion**: Added `GET /collections` and `DELETE /collections/:name` endpoints. Fixed filter parameter borrowing in `search_vectors`.
+8. **Automated Verification Gates**: All gate tests (`flaw_audit_gate`, `milestone6_gate`, `milestone7_gate`, `milestone8_gate`) passed with 100% clean success.
+

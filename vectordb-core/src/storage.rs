@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
-use crate::distance::{DistanceMetric, MetricType, get_distance_metric};
+use crate::distance::{MetricType, get_distance_metric};
 use crate::error::{Result, VectorDbError};
 
 /// Search result holding the vector ID, metric distance score, and metadata
@@ -232,6 +232,32 @@ impl VectorStorage {
 
     pub fn raw_data(&self) -> &[f32] {
         &self.data
+    }
+
+    pub fn raw_idx_to_id(&self) -> &[u64] {
+        &self.idx_to_id
+    }
+
+    pub fn compact(&mut self) {
+        let dim = self.dim;
+        let mut new_data = Vec::with_capacity((self.idx_to_id.len() - self.deleted.len()) * dim);
+        let mut new_idx_to_id = Vec::with_capacity(self.idx_to_id.len() - self.deleted.len());
+        let mut new_id_to_idx = HashMap::with_capacity(self.idx_to_id.len() - self.deleted.len());
+
+        for (idx, &id) in self.idx_to_id.iter().enumerate() {
+            if self.deleted.contains(&id) {
+                continue;
+            }
+            let start = idx * dim;
+            new_data.extend_from_slice(&self.data[start..start + dim]);
+            new_id_to_idx.insert(id, new_idx_to_id.len());
+            new_idx_to_id.push(id);
+        }
+
+        self.data = new_data;
+        self.idx_to_id = new_idx_to_id;
+        self.id_to_idx = new_id_to_idx;
+        self.deleted.clear();
     }
 }
 
