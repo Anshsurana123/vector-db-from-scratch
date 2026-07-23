@@ -219,6 +219,11 @@ fn filtered_brute_force(
         storage.get_vector(id).map(|v| v.to_vec())
     }
 
+    pub fn get_metadata(&self, id: u64) -> Option<serde_json::Value> {
+        let storage = self.storage.read();
+        storage.get_metadata(id).cloned()
+    }
+
     pub fn len(&self) -> usize {
         let storage = self.storage.read();
         storage.len()

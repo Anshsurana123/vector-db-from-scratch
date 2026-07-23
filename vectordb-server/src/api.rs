@@ -84,12 +84,29 @@ pub fn app(db: Arc<VectorDb>) -> Router {
         .route("/collections/:name", get(get_collection).delete(drop_collection))
         .route("/collections/:name/insert", post(insert_vector))
         .route("/collections/:name/search", post(search_vectors))
-        .route("/collections/:name/vectors/:id", delete(delete_vector))
+        .route("/collections/:name/vectors/:id", get(get_vector_by_id).delete(delete_vector))
         .route("/collections/:name/compact", post(compact_collection))
         .route("/snapshot", post(create_snapshot))
         .route("/collections/:name/snapshot", post(create_snapshot))
         .route("/collections/:name/train_pq", post(train_pq))
         .with_state(state)
+}
+
+async fn get_vector_by_id(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, u64)>,
+) -> Result<impl IntoResponse, AppError> {
+    let col = state.db.get_collection(&name)?;
+    let vec = col.get_vector(id).ok_or(VectorDbError::VectorNotFound(id))?;
+    let metadata = col.get_metadata(id);
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "id": id,
+            "vector": vec,
+            "metadata": metadata,
+        })),
+    ))
 }
 
 async fn create_collection(
@@ -162,7 +179,7 @@ async fn search_vectors(
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let col = state.db.get_collection(&name)?;
-    let ef_search = req.ef_search.unwrap_or(32);
+    let ef_search = req.ef_search.unwrap_or(col.config().ef_search);
     
     let results = if req.use_pq.unwrap_or(false) {
         col.search_pq(&req.query, req.k, ef_search)?

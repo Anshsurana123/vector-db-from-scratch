@@ -99,7 +99,17 @@ async fn test_milestone6_gate() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Top Result ID: {}, Distance: {:.4}", results[0].id, results[0].distance);
 
     // 5. Delete Vector via HTTP DELETE /collections/http_test_col/vectors/42
-    println!("\n[4/4] Testing DELETE /collections/http_test_col/vectors/42...");
+    println!("\n[4/5] Testing GET /collections/http_test_col/vectors/42...");
+    let get_res = client
+        .get(format!("{}/collections/http_test_col/vectors/42", base_url))
+        .send()
+        .await?;
+    assert_eq!(get_res.status(), reqwest::StatusCode::OK);
+    let get_val: serde_json::Value = get_res.json().await?;
+    assert_eq!(get_val["id"], 42);
+    assert!(get_val["vector"].is_array());
+
+    println!("\n[5/5] Testing DELETE /collections/http_test_col/vectors/42...");
     let res = client
         .delete(format!("{}/collections/http_test_col/vectors/42", base_url))
         .send()
@@ -107,6 +117,13 @@ async fn test_milestone6_gate() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  HTTP Status: {}", res.status());
     assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+    // Verify GET after delete returns 404
+    let get_res_after = client
+        .get(format!("{}/collections/http_test_col/vectors/42", base_url))
+        .send()
+        .await?;
+    assert_eq!(get_res_after.status(), reqwest::StatusCode::NOT_FOUND);
 
     // Verify vector 42 is absent from search results
     let res = client
