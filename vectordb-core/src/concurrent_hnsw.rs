@@ -70,6 +70,7 @@ impl Ord for MaxCandidate {
     }
 }
 
+#[derive(Debug)]
 pub struct ConcurrentHnswNode {
     pub id: u64,
     pub storage_idx: usize,
@@ -77,6 +78,7 @@ pub struct ConcurrentHnswNode {
     pub neighbors: Vec<RwLock<Vec<usize>>>,
 }
 
+#[derive(Debug)]
 pub struct ConcurrentHnswIndex {
     pub config: HnswConfig,
     pub metric: MetricType,
@@ -351,5 +353,104 @@ impl ConcurrentHnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct ConcurrentHnswNodeSurrogate {
+    pub id: u64,
+    pub storage_idx: usize,
+    pub level: usize,
+    pub neighbors: Vec<Vec<usize>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ConcurrentHnswIndexSurrogate {
+    pub config: HnswConfig,
+    pub metric: MetricType,
+    pub nodes: Vec<ConcurrentHnswNodeSurrogate>,
+    pub entry_point: usize,
+    pub max_layer: usize,
+    pub has_entry_point: bool,
+}
+
+impl Serialize for ConcurrentHnswIndex {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let nodes = self.nodes.read().iter().map(|n| {
+            ConcurrentHnswNodeSurrogate {
+                id: n.id,
+                storage_idx: n.storage_idx,
+                level: n.level,
+                neighbors: n.neighbors.iter().map(|l| l.read().clone()).collect(),
+            }
+        }).collect();
+        
+        let surrogate = ConcurrentHnswIndexSurrogate {
+            config: self.config.clone(),
+            metric: self.metric,
+            nodes,
+            entry_point: self.entry_point.load(AtomicOrdering::SeqCst),
+            max_layer: self.max_layer.load(AtomicOrdering::SeqCst),
+            has_entry_point: self.has_entry_point.load(AtomicOrdering::SeqCst),
+        };
+        surrogate.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConcurrentHnswIndex {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let surrogate = ConcurrentHnswIndexSurrogate::deserialize(deserializer)?;
+        let nodes = surrogate.nodes.into_iter().map(|n| {
+            std::sync::Arc::new(ConcurrentHnswNode {
+                id: n.id,
+                storage_idx: n.storage_idx,
+                level: n.level,
+                neighbors: n.neighbors.into_iter().map(|l| RwLock::new(l)).collect(),
+            })
+        }).collect();
+        
+        Ok(Self {
+            config: surrogate.config,
+            metric: surrogate.metric,
+            nodes: RwLock::new(nodes),
+            entry_point: AtomicUsize::new(surrogate.entry_point),
+            max_layer: AtomicUsize::new(surrogate.max_layer),
+            has_entry_point: std::sync::atomic::AtomicBool::new(surrogate.has_entry_point),
+            visited_tags: Mutex::new(Vec::new()),
+            visit_id_counter: AtomicU32::new(1),
+        })
+    }
+}
+
+impl Clone for ConcurrentHnswIndex {
+    fn clone(&self) -> Self {
+        let nodes = self.nodes.read().iter().map(|n| {
+            std::sync::Arc::new(ConcurrentHnswNode {
+                id: n.id,
+                storage_idx: n.storage_idx,
+                level: n.level,
+                neighbors: n.neighbors.iter().map(|l| RwLock::new(l.read().clone())).collect(),
+            })
+        }).collect();
+        
+        Self {
+            config: self.config.clone(),
+            metric: self.metric,
+            nodes: RwLock::new(nodes),
+            entry_point: AtomicUsize::new(self.entry_point.load(AtomicOrdering::SeqCst)),
+            max_layer: AtomicUsize::new(self.max_layer.load(AtomicOrdering::SeqCst)),
+            has_entry_point: std::sync::atomic::AtomicBool::new(self.has_entry_point.load(AtomicOrdering::SeqCst)),
+            visited_tags: Mutex::new(Vec::new()),
+            visit_id_counter: AtomicU32::new(1),
+        }
     }
 }

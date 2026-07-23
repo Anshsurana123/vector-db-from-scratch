@@ -21,6 +21,8 @@ pub struct CreateCollectionRequest {
     pub name: String,
     pub dim: usize,
     pub metric: MetricType,
+    pub is_quantized: Option<bool>,
+    pub num_subvectors: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +38,7 @@ pub struct SearchRequest {
     pub k: usize,
     pub ef_search: Option<usize>,
     pub filter: Option<FilterExpression>,
+    pub use_pq: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +85,9 @@ pub fn app(db: Arc<VectorDb>) -> Router {
         .route("/collections/:name/insert", post(insert_vector))
         .route("/collections/:name/search", post(search_vectors))
         .route("/collections/:name/vectors/:id", delete(delete_vector))
+        .route("/collections/:name/compact", post(compact_collection))
+        .route("/snapshot", post(create_snapshot))
+        .route("/collections/:name/train_pq", post(train_pq))
         .with_state(state)
 }
 
@@ -90,6 +96,13 @@ async fn create_collection(
     Json(req): Json<CreateCollectionRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let col = state.db.create_collection(req.name, req.dim, req.metric)?;
+    
+    if req.is_quantized.unwrap_or(false) {
+        if let Some(num_sub) = req.num_subvectors {
+            col.enable_pq(num_sub)?;
+        }
+    }
+    
     let res = CollectionInfoResponse {
         name: col.name().to_string(),
         dim: col.dim(),
@@ -136,13 +149,16 @@ async fn search_vectors(
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let col = state.db.get_collection(&name)?;
-    let results: Vec<SearchResult> = match req.filter {
-        Some(ref filter) => col.search_with_filter(&req.query, req.k, filter)?,
-        None => match req.ef_search {
-            Some(ef) => col.search_hnsw(&req.query, req.k, ef)?,
-            None => col.search(&req.query, req.k)?,
-        },
+    let ef_search = req.ef_search.unwrap_or(32);
+    
+    let results = if req.use_pq.unwrap_or(false) {
+        col.search_pq(&req.query, req.k, ef_search)?
+    } else if let Some(filter) = req.filter {
+        col.search_with_filter(&req.query, req.k, filter)?
+    } else {
+        col.search_hnsw(&req.query, req.k, ef_search)?
     };
+
     Ok((StatusCode::OK, Json(results)))
 }
 
@@ -157,4 +173,33 @@ async fn delete_vector(
     } else {
         Err(AppError(VectorDbError::VectorNotFound(id)))
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrainPqRequest {
+    pub num_subvectors: usize,
+}
+
+async fn compact_collection(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    state.db.compact_collection(&name)?;
+    Ok(StatusCode::OK)
+}
+
+async fn create_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    state.db.save_snapshot()?;
+    Ok(StatusCode::OK)
+}
+
+async fn train_pq(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<TrainPqRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    state.db.train_pq(&name, req.num_subvectors)?;
+    Ok(StatusCode::OK)
 }

@@ -24,6 +24,8 @@ pub struct CollectionSnapshotData {
     pub hnsw: HnswIndex,
     #[serde(default = "default_concurrent_hnsw")]
     pub concurrent_hnsw: crate::concurrent_hnsw::ConcurrentHnswIndex,
+    #[serde(default)]
+    pub pq_storage: Option<crate::pq::QuantizedVectorStorage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +102,8 @@ mod tests {
                 config: HnswConfig::default(),
                 storage,
                 hnsw,
+                use_concurrent_index: false,
+                concurrent_hnsw: crate::concurrent_hnsw::ConcurrentHnswIndex::new(HnswConfig::default(), MetricType::L2),
             }],
         };
 
