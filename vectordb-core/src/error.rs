@@ -17,6 +17,9 @@ pub enum VectorDbError {
     #[error("Collection {0} already exists")]
     CollectionAlreadyExists(String),
 
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("Storage error: {0}")]
     StorageError(String),
 

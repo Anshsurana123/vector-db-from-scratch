@@ -6,6 +6,7 @@ use std::time::Instant;
 use vectordb_core::{HnswConfig, MetricType, VectorDb};
 
 #[test]
+#[ignore = "Long-running 50k recall benchmark test; run with cargo test --release --test debug_recall -- --ignored --nocapture"]
 fn test_debug_recall_50k() -> Result<(), Box<dyn std::error::Error>> {
     let num_vectors = 50_000;
     let dim = 128;

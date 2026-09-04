@@ -1,7 +1,7 @@
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
-use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use parking_lot::RwLock;
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -86,9 +86,6 @@ pub struct ConcurrentHnswIndex {
     pub entry_point: AtomicUsize,
     pub max_layer: AtomicUsize,
     pub has_entry_point: std::sync::atomic::AtomicBool,
-
-    visited_tags: Mutex<Vec<u32>>,
-    visit_id_counter: AtomicU32,
 }
 
 type ArcNode = std::sync::Arc<ConcurrentHnswNode>;
@@ -102,8 +99,6 @@ impl ConcurrentHnswIndex {
             entry_point: AtomicUsize::new(0),
             max_layer: AtomicUsize::new(0),
             has_entry_point: std::sync::atomic::AtomicBool::new(false),
-            visited_tags: Mutex::new(Vec::new()),
-            visit_id_counter: AtomicU32::new(1),
         }
     }
 
@@ -133,29 +128,12 @@ impl ConcurrentHnswIndex {
         storage: &VectorStorage,
         nodes: &[ArcNode],
     ) -> (BinaryHeap<MaxCandidate>, usize) {
-        let mut visit_id = self.visit_id_counter.fetch_add(1, AtomicOrdering::Relaxed);
-        let mut visited = self.visited_tags.lock();
-        
-        let num_nodes = nodes.len();
-        if visited.len() < num_nodes {
-            visited.resize(num_nodes + 1024, 0);
-        }
-
-        if visit_id == u32::MAX {
-            for tag in visited.iter_mut() {
-                *tag = 0;
-            }
-            self.visit_id_counter.store(1, AtomicOrdering::Relaxed);
-            visit_id = 1;
-        }
-
+        let mut visited = roaring::RoaringBitmap::new();
         let mut min_candidates = BinaryHeap::new();
         let mut max_results = BinaryHeap::new();
 
         for &node_idx in ep {
-            if node_idx < visited.len() {
-                visited[node_idx] = visit_id;
-            }
+            visited.insert(node_idx as u32);
             if node_idx < nodes.len() {
                 let st_idx = nodes[node_idx].storage_idx.load(AtomicOrdering::Relaxed);
                 if st_idx != usize::MAX {
@@ -184,9 +162,7 @@ impl ConcurrentHnswIndex {
                 if lc < node.neighbors.len() {
                     let nbr_read_guard = node.neighbors[lc].read();
                     for &nbr_idx in nbr_read_guard.iter() {
-                        if nbr_idx < visited.len() && visited[nbr_idx] != visit_id {
-                            visited[nbr_idx] = visit_id;
-
+                        if visited.insert(nbr_idx as u32) {
                             if nbr_idx < nodes.len() {
                                 let nbr_st_idx = nodes[nbr_idx].storage_idx.load(AtomicOrdering::Relaxed);
                                 if nbr_st_idx != usize::MAX {
@@ -614,8 +590,6 @@ impl<'de> Deserialize<'de> for ConcurrentHnswIndex {
             entry_point: AtomicUsize::new(surrogate.entry_point),
             max_layer: AtomicUsize::new(surrogate.max_layer),
             has_entry_point: std::sync::atomic::AtomicBool::new(surrogate.has_entry_point),
-            visited_tags: Mutex::new(Vec::new()),
-            visit_id_counter: AtomicU32::new(1),
         })
     }
 }
@@ -638,8 +612,6 @@ impl Clone for ConcurrentHnswIndex {
             entry_point: AtomicUsize::new(self.entry_point.load(AtomicOrdering::SeqCst)),
             max_layer: AtomicUsize::new(self.max_layer.load(AtomicOrdering::SeqCst)),
             has_entry_point: std::sync::atomic::AtomicBool::new(self.has_entry_point.load(AtomicOrdering::SeqCst)),
-            visited_tags: Mutex::new(Vec::new()),
-            visit_id_counter: AtomicU32::new(1),
         }
     }
 }

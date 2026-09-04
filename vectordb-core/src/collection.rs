@@ -235,6 +235,11 @@ fn filtered_brute_force(
         self.len() == 0
     }
 
+    pub fn contains(&self, id: u64) -> bool {
+        let storage = self.storage.read();
+        storage.get_idx_by_id(id).is_some()
+    }
+
     pub fn compact(&self) {
         let mut storage = self.storage.write();
         let remapped = storage.compact();
@@ -365,8 +370,6 @@ impl VectorDb {
                 } else {
                     IndexWrapper::Standard(RwLock::new(col_snap.hnsw))
                 };
-                let col_wal_path = dir.join(format!("wal_{}.wal", col_snap.name));
-                let col_wal_writer = WalWriter::open(&col_wal_path).ok();
                 let collection = Arc::new(Collection {
                     name: col_snap.name.clone(),
                     dim: col_snap.dim,
@@ -376,7 +379,7 @@ impl VectorDb {
                     storage: std::sync::Arc::new(RwLock::new(col_snap.storage)),
                     index,
                     pq: RwLock::new(col_snap.pq_storage),
-                    wal_writer: Mutex::new(col_wal_writer),
+                    wal_writer: Mutex::new(None),
                 });
                 collections_guard.insert(col_snap.name, collection);
             }
@@ -394,7 +397,16 @@ impl VectorDb {
             }
         }
 
-        // 3. Open system WAL for DDL appends
+        // 3. Open collection WAL writers and system WAL for future appends
+        let collections_guard = db.collections.read();
+        for (name, col) in collections_guard.iter() {
+            let col_wal_path = dir.join(format!("wal_{}.wal", name));
+            if let Ok(writer) = WalWriter::open(&col_wal_path) {
+                *col.wal_writer.lock() = Some(writer);
+            }
+        }
+        drop(collections_guard);
+
         let system_wal_path = dir.join("wal_system.wal");
         let writer = WalWriter::open(&system_wal_path)?;
         *db.wal_writer.lock() = Some(writer);
@@ -408,22 +420,23 @@ impl VectorDb {
                 let mut collections = self.collections.write();
                 if !collections.contains_key(name) {
                     let col = Collection::new_with_config(name.clone(), *dim, *metric, config.clone());
-                    if let Some(dir) = &self.db_dir {
-                        let col_wal_path = dir.join(format!("wal_{}.wal", name));
-                        if let Ok(w) = WalWriter::open(&col_wal_path) {
-                            *col.wal_writer.lock() = Some(w);
-                        }
-                    }
                     collections.insert(name.clone(), Arc::new(col));
                 }
             }
+            WalOp::DropCollection { name } => {
+                let mut collections = self.collections.write();
+                collections.remove(name);
+            }
             WalOp::Insert { collection, id, vector, metadata } => {
                 let col = self.get_collection(collection)?;
+                if col.contains(*id) {
+                    let _ = col.delete(*id);
+                }
                 col.insert(*id, vector, metadata.clone())?;
             }
             WalOp::Delete { collection, id } => {
                 let col = self.get_collection(collection)?;
-                col.delete(*id)?;
+                let _ = col.delete(*id);
             }
         }
         Ok(())
@@ -497,14 +510,22 @@ impl VectorDb {
         metadata: Option<serde_json::Value>,
     ) -> Result<()> {
         let col = self.get_collection(collection_name)?;
-        col.insert(id, vector, metadata.clone())?;
+        if vector.len() != col.dim() {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: col.dim(),
+                actual: vector.len(),
+            });
+        }
+        if col.contains(id) {
+            return Err(VectorDbError::DuplicateId(id));
+        }
 
         let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let op = WalOp::Insert {
             collection: collection_name.to_string(),
             id,
             vector: vector.to_vec(),
-            metadata,
+            metadata: metadata.clone(),
         };
 
         // Write to collection's WAL if available; fallback to system WAL
@@ -520,36 +541,37 @@ impl VectorDb {
             }
         }
 
+        col.insert(id, vector, metadata)?;
         self.check_auto_snapshot();
         Ok(())
     }
 
     pub fn delete_vector(&self, collection_name: &str, id: u64) -> Result<bool> {
         let col = self.get_collection(collection_name)?;
-        let deleted = col.delete(id)?;
-
-        if deleted {
-            let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let op = WalOp::Delete {
-                collection: collection_name.to_string(),
-                id,
-            };
-
-            let mut col_wal = col.wal_writer.lock();
-            if let Some(writer) = col_wal.as_mut() {
-                writer.append(seq, &op)?;
-                writer.flush()?;
-            } else {
-                let mut wal_guard = self.wal_writer.lock();
-                if let Some(writer) = wal_guard.as_mut() {
-                    writer.append(seq, &op)?;
-                    writer.flush()?;
-                }
-            }
-
-            self.check_auto_snapshot();
+        if !col.contains(id) {
+            return Ok(false);
         }
 
+        let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let op = WalOp::Delete {
+            collection: collection_name.to_string(),
+            id,
+        };
+
+        let mut col_wal = col.wal_writer.lock();
+        if let Some(writer) = col_wal.as_mut() {
+            writer.append(seq, &op)?;
+            writer.flush()?;
+        } else {
+            let mut wal_guard = self.wal_writer.lock();
+            if let Some(writer) = wal_guard.as_mut() {
+                writer.append(seq, &op)?;
+                writer.flush()?;
+            }
+        }
+
+        let deleted = col.delete(id)?;
+        self.check_auto_snapshot();
         Ok(deleted)
     }
 
@@ -648,7 +670,29 @@ impl VectorDb {
 
     pub fn drop_collection(&self, name: &str) -> Result<bool> {
         let mut collections = self.collections.write();
-        Ok(collections.remove(name).is_some())
+        let removed = collections.remove(name).is_some();
+        drop(collections);
+
+        if removed {
+            if let Some(dir) = &self.db_dir {
+                let col_wal_path = dir.join(format!("wal_{}.wal", name));
+                if col_wal_path.exists() {
+                    let _ = std::fs::remove_file(&col_wal_path);
+                }
+            }
+
+            let mut wal_guard = self.wal_writer.lock();
+            if let Some(writer) = wal_guard.as_mut() {
+                let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let op = WalOp::DropCollection {
+                    name: name.to_string(),
+                };
+                writer.append(seq, &op)?;
+                writer.flush()?;
+            }
+        }
+
+        Ok(removed)
     }
 
     pub fn list_collections(&self) -> Vec<String> {

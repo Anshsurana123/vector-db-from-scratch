@@ -10,6 +10,33 @@ use crate::hnsw::HnswConfig;
 
 const WAL_MAGIC: &[u8; 4] = b"VWAL";
 
+mod json_opt_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(opt: &Option<serde_json::Value>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let opt_str: Option<String> = opt.as_ref().map(|v| v.to_string());
+        opt_str.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Option<serde_json::Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt_str = Option::<String>::deserialize(deserializer)?;
+        match opt_str {
+            Some(s) => {
+                let val = serde_json::from_str(&s).map_err(serde::de::Error::custom)?;
+                Ok(Some(val))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOp {
     CreateCollection {
@@ -18,10 +45,14 @@ pub enum WalOp {
         metric: MetricType,
         config: HnswConfig,
     },
+    DropCollection {
+        name: String,
+    },
     Insert {
         collection: String,
         id: u64,
         vector: Vec<f32>,
+        #[serde(with = "json_opt_serde")]
         metadata: Option<serde_json::Value>,
     },
     Delete {
@@ -65,6 +96,7 @@ impl WalWriter {
             WalOp::CreateCollection { .. } => 1,
             WalOp::Insert { .. } => 2,
             WalOp::Delete { .. } => 3,
+            WalOp::DropCollection { .. } => 4,
         };
 
         // Compute CRC32 over header + payload
@@ -89,16 +121,29 @@ impl WalWriter {
 
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+        self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
     }
 
     pub fn truncate(&mut self) -> Result<()> {
         self.writer.flush()?;
-        let file = self.writer.get_mut();
-        file.set_len(0)?;
-        file.seek(std::io::SeekFrom::Start(0))?;
-        file.sync_all()?;
+        let trunc_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        trunc_file.sync_all()?;
+        drop(trunc_file);
+
+        let append_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)?;
+        self.writer = BufWriter::new(append_file);
         Ok(())
     }
 
@@ -134,41 +179,60 @@ impl WalReader {
             };
 
             let mut magic = [0u8; 4];
-            if reader.read_exact(&mut magic).is_err() {
-                break;
+            match reader.read_exact(&mut magic) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => return Err(VectorDbError::IoError(e)),
             }
             if &magic != WAL_MAGIC {
-                println!("WAL recovery: Invalid magic bytes at offset {}, stopping.", current_pos);
-                break;
+                return Err(VectorDbError::StorageError(format!(
+                    "Invalid WAL magic bytes at offset {} in {:?}",
+                    current_pos, path_ref
+                )));
             }
 
             let mut op_type_buf = [0u8; 1];
-            if reader.read_exact(&mut op_type_buf).is_err() {
-                break;
+            if let Err(e) = reader.read_exact(&mut op_type_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(VectorDbError::IoError(e));
             }
 
             let mut seq_buf = [0u8; 8];
-            if reader.read_exact(&mut seq_buf).is_err() {
-                break;
+            if let Err(e) = reader.read_exact(&mut seq_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(VectorDbError::IoError(e));
             }
             let seq = u64::from_le_bytes(seq_buf);
 
             let mut len_buf = [0u8; 4];
-            if reader.read_exact(&mut len_buf).is_err() {
-                break;
+            if let Err(e) = reader.read_exact(&mut len_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(VectorDbError::IoError(e));
             }
             let payload_len = u32::from_le_bytes(len_buf) as usize;
 
             let mut payload = vec![0u8; payload_len];
-            if reader.read_exact(&mut payload).is_err() {
-                println!("WAL recovery: Partial frame payload at offset {}, stopping.", current_pos);
-                break;
+            if let Err(e) = reader.read_exact(&mut payload) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(VectorDbError::IoError(e));
             }
 
             let mut crc_buf = [0u8; 4];
-            if reader.read_exact(&mut crc_buf).is_err() {
-                println!("WAL recovery: Partial CRC32 trailer at offset {}, stopping.", current_pos);
-                break;
+            if let Err(e) = reader.read_exact(&mut crc_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(VectorDbError::IoError(e));
             }
             let expected_crc = u32::from_le_bytes(crc_buf);
 
@@ -182,8 +246,11 @@ impl WalReader {
             let actual_crc = hasher.finalize();
 
             if actual_crc != expected_crc {
-                println!("WAL recovery: CRC32 mismatch at offset {} (expected {}, got {}), truncating.", current_pos, expected_crc, actual_crc);
-                break;
+                return Err(VectorDbError::WalCrcMismatch {
+                    offset: current_pos,
+                    expected: expected_crc,
+                    actual: actual_crc,
+                });
             }
 
             let op: WalOp = bincode::deserialize(&payload)
@@ -198,7 +265,7 @@ impl WalReader {
 
         drop(reader);
 
-        // If file was truncated at partial frame, trim corrupted EOF bytes
+        // If file had a partial record at EOF, trim truncated EOF bytes
         if last_valid_offset < file_len {
             println!("Truncating WAL file {:?} from {} bytes to {} valid bytes.", path_ref, file_len, last_valid_offset);
             file.set_len(last_valid_offset)?;

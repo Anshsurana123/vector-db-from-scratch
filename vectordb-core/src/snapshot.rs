@@ -64,7 +64,13 @@ impl SnapshotEngine {
     }
 
     pub fn load_snapshot(db_dir: impl AsRef<Path>) -> Result<Option<DbSnapshotData>> {
-        let final_path = db_dir.as_ref().join("snapshot.snap");
+        let dir = db_dir.as_ref();
+        let tmp_path = dir.join("snapshot.snap.tmp");
+        if tmp_path.exists() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+
+        let final_path = dir.join("snapshot.snap");
         if !final_path.exists() {
             return Ok(None);
         }

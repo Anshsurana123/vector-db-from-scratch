@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -59,19 +59,25 @@ impl From<VectorDbError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self.0 {
-            VectorDbError::CollectionNotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-            VectorDbError::VectorNotFound(id) => (StatusCode::NOT_FOUND, format!("Vector ID {} not found", id)),
-            VectorDbError::CollectionAlreadyExists(msg) => (StatusCode::CONFLICT, msg.clone()),
-            VectorDbError::DuplicateId(id) => (StatusCode::CONFLICT, format!("Vector ID {} already exists", id)),
+        let (status, code, message) = match &self.0 {
+            VectorDbError::CollectionNotFound(msg) => (StatusCode::NOT_FOUND, "COLLECTION_NOT_FOUND", msg.clone()),
+            VectorDbError::VectorNotFound(id) => (StatusCode::NOT_FOUND, "VECTOR_NOT_FOUND", format!("Vector ID {} not found", id)),
+            VectorDbError::CollectionAlreadyExists(msg) => (StatusCode::CONFLICT, "COLLECTION_ALREADY_EXISTS", msg.clone()),
+            VectorDbError::DuplicateId(id) => (StatusCode::CONFLICT, "DUPLICATE_ID", format!("Vector ID {} already exists", id)),
             VectorDbError::DimensionMismatch { expected, actual } => (
                 StatusCode::BAD_REQUEST,
+                "DIMENSION_MISMATCH",
                 format!("Dimension mismatch: expected {}, got {}", expected, actual),
             ),
-            err => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            VectorDbError::InvalidParameter(msg) => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_PARAMETER",
+                msg.clone(),
+            ),
+            err => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", err.to_string()),
         };
 
-        let body = Json(json!({ "error": message }));
+        let body = Json(json!({ "error": message, "code": code }));
         (status, body).into_response()
     }
 }
@@ -113,6 +119,16 @@ async fn create_collection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if req.name.trim().is_empty() {
+        return Err(AppError(VectorDbError::InvalidParameter(
+            "Collection name cannot be empty".to_string(),
+        )));
+    }
+    if req.dim == 0 {
+        return Err(AppError(VectorDbError::InvalidParameter(
+            "Dimension must be greater than 0".to_string(),
+        )));
+    }
     let col = state.db.create_collection(req.name, req.dim, req.metric)?;
     
     if req.is_quantized.unwrap_or(false) {
@@ -168,8 +184,12 @@ async fn insert_vector(
     Path(name): Path<String>,
     Json(req): Json<InsertVectorRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let col = state.db.get_collection(&name)?;
-    col.insert(req.id, &req.vector, req.metadata)?;
+    if req.vector.is_empty() {
+        return Err(AppError(VectorDbError::InvalidParameter(
+            "Vector cannot be empty".to_string(),
+        )));
+    }
+    state.db.insert_vector(&name, req.id, &req.vector, req.metadata)?;
     Ok((StatusCode::OK, Json(json!({ "status": "inserted", "id": req.id }))))
 }
 
@@ -178,6 +198,16 @@ async fn search_vectors(
     Path(name): Path<String>,
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if req.query.is_empty() {
+        return Err(AppError(VectorDbError::InvalidParameter(
+            "Query vector cannot be empty".to_string(),
+        )));
+    }
+    if req.k == 0 {
+        return Err(AppError(VectorDbError::InvalidParameter(
+            "k must be greater than 0".to_string(),
+        )));
+    }
     let col = state.db.get_collection(&name)?;
     let ef_search = req.ef_search.unwrap_or(col.config().ef_search);
     
@@ -196,8 +226,7 @@ async fn delete_vector(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, u64)>,
 ) -> Result<impl IntoResponse, AppError> {
-    let col = state.db.get_collection(&name)?;
-    let deleted = col.delete(id)?;
+    let deleted = state.db.delete_vector(&name, id)?;
     if deleted {
         Ok((StatusCode::OK, Json(json!({ "status": "deleted", "id": id }))))
     } else {

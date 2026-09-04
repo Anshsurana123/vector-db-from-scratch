@@ -17,14 +17,14 @@ fn test_flaw_1_and_4_http_wal_and_snapshot_truncation() -> Result<()> {
         db.insert_vector("test_col", i, &[i as f32, 0.0, 0.0, 0.0], None)?;
     }
 
-    let wal_path = db_dir.join("wal.wal");
-    assert!(wal_path.exists());
-    let wal_len_before = fs::metadata(&wal_path)?.len();
+    let col_wal_path = db_dir.join("wal_test_col.wal");
+    assert!(col_wal_path.exists());
+    let wal_len_before = fs::metadata(&col_wal_path)?.len();
     assert!(wal_len_before > 0, "WAL file should contain appended frames");
 
     // Save snapshot -> WAL should be truncated to 0 bytes
     db.save_snapshot()?;
-    let wal_len_after = fs::metadata(&wal_path)?.len();
+    let wal_len_after = fs::metadata(&col_wal_path)?.len();
     assert_eq!(wal_len_after, 0, "WAL file should be truncated to 0 bytes after snapshot");
 
     // Add 5 more vectors after snapshot

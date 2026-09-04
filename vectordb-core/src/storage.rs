@@ -50,6 +50,35 @@ impl Ord for Candidate {
     }
 }
 
+mod json_map_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(map: &HashMap<u64, serde_json::Value>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let string_map: HashMap<u64, String> = map
+            .iter()
+            .map(|(k, v)| (*k, v.to_string()))
+            .collect();
+        string_map.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<HashMap<u64, serde_json::Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string_map = HashMap::<u64, String>::deserialize(deserializer)?;
+        let mut map = HashMap::with_capacity(string_map.len());
+        for (k, v_str) in string_map {
+            let val = serde_json::from_str(&v_str).map_err(serde::de::Error::custom)?;
+            map.insert(k, val);
+        }
+        Ok(map)
+    }
+}
+
 /// Flat contiguous vector storage with id-offset indexing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStorage {
@@ -57,6 +86,7 @@ pub struct VectorStorage {
     data: Vec<f32>,
     id_to_idx: HashMap<u64, usize>,
     idx_to_id: Vec<u64>,
+    #[serde(with = "json_map_serde")]
     metadata_store: HashMap<u64, serde_json::Value>,
     deleted: HashSet<u64>,
 }

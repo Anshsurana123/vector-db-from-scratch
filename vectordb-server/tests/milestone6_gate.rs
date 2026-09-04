@@ -3,7 +3,7 @@ use rand::rngs::StdRng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use vectordb_core::{MetricType, SearchResult, VectorDb};
+use vectordb_core::{SearchResult, VectorDb};
 use vectordb_server::app;
 
 fn generate_normalized_vector<R: Rng>(rng: &mut R, dim: usize) -> Vec<f32> {

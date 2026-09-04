@@ -73,7 +73,7 @@ fn test_milestone5_gate() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_false_positives = 0;
     let start_search = Instant::now();
 
-    for (q_idx, q) in queries.iter().enumerate() {
+    for (_q_idx, q) in queries.iter().enumerate() {
         // 1. Compute Filtered Brute-Force Ground Truth
         let all_bf = collection.search_brute_force(q, num_vectors)?;
         let filtered_gt: Vec<_> = all_bf

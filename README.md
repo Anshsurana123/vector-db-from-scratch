@@ -2,242 +2,358 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/Anshsurana123/vector-db-from-scratch)
+[![Build Status](https://img.shields.io/badge/tests-all%20passing-brightgreen.svg)](#comprehensive-test-suite--verification-gates)
 
-A production-grade, high-performance, embedded and RESTful **Vector Database** implemented from first principles in **Rust**. 
+A high-performance, embedded and RESTful **Vector Database** implemented from first principles in **Rust**.
 
-Built for ultra-low latency approximate nearest neighbor (ANN) search, high-throughput vector indexing, memory-efficient product quantization, structured metadata filtering, append-only Write-Ahead Logging (WAL) crash recovery, and thread-safe concurrent mutations.
-
----
-
-## 🌟 Key Architectural Features
-
-### 🚀 1. HNSW Graph Indexing (Malkov & Yashunin 2018)
-- **Multi-Layer Graph Topology**: Hierarchical Navigable Small World (HNSW) graph for fast sub-linear search complexity.
-- **Algorithm 4 Heuristic Diversity Selection**: Prevents spatial clustering traps by enforcing directional diversity among graph node neighbors.
-- **Zero-Allocation Visited Markers**: Atomic/L1-cache indexed marker array (`visited_tags: Vec<u32>`) eliminating per-query heap allocations.
-- **Upper-Layer Candidate Beam Propagation**: Dynamic beam search ($efUpper = \min(ef, 8)$) across upper levels prevents local minima trapping during multi-layer entry point descent.
-
-### 📐 2. Pluggable Distance Metrics & SIMD Optimization
-- Supports **L2 (Euclidean)**, **Cosine Similarity**, and **Dot Product** distance metrics.
-- Optimized with 4-accumulator SIMD unrolling (`vsubps`, `vfmadd231ps`) for fast vector distance evaluation.
-
-### 💾 3. Persistence, WAL & Crash Recovery
-- **Append-Only Write-Ahead Log (WAL)**: Custom binary framed encoding (`[magic:4][op_type:1][seq:8][payload_len:4][payload][crc32:4]`) with `crc32fast` checksum verification.
-- **EOF Corruption Truncation**: Automatically truncates incomplete or un-flushed partial frames during crash recovery.
-- **Atomic Bincode Snapshots**: Atomic state persistence via `.snap.tmp` -> `.snap` rename semantics with WAL log zero-out truncation upon snapshot creation.
-- **Sub-2s Recovery**: Recovers 100,000 vectors with 100% state restoration in under 1.76 seconds.
-
-### 📦 4. Product Quantization (PQ) Vector Compression
-- **K-Means++ Subspace Codebooks**: Encodes vectors into $m$ sub-spaces with $k=256$ centroids.
-- **$8.00\times$ RAM Footprint Compression**: Compresses raw 128-dimensional floating-point vectors (512 bytes) into 64-byte `u8` codebooks.
-- **Asymmetric Distance Computation (ADC)**: Evaluates vector queries using precomputed Look-Up Tables (LUTs) with zero floating-point multiplications at ~1.12ms per query.
-
-### 🔍 5. Structured Metadata Filtering & Query Planning
-- **JSON Metadata Engine**: Filter expressions supporting `Eq`, `Gt`, `Gte`, `Lt`, `Lte`, `In`, `And`, and `Or` operations over JSON metadata objects.
-- **In-Graph Pre-filtering**: `search_with_filter` evaluates metadata conditions during graph traversal, pruning unmatching nodes prior to candidate heap insertion (achieving 100% recall with 0 false positives).
-- **Hybrid Query Planner**: Evaluates filter selectivity dynamically to route queries between **BruteForceScan**, **FilteredScan**, and **HnswFiltered** execution paths.
-
-### 🔒 6. Thread-Safe Concurrent Mutations
-- **Concurrent HNSW Index**: Node neighbor lists protected by fine-grained `parking_lot::RwLock` locks.
-- Allows thousands of concurrent read searches during active background graph insertions with zero global index locks.
-
-### 🌐 7. Production-Ready REST API (`axum` + `tokio`)
-- Complete RESTful HTTP interface for collection management, vector ingestion, vector retrieval by ID, ANN search, metadata filtered search, PQ training, storage compaction, and snapshot creation.
+Built for sub-millisecond approximate nearest neighbor (ANN) search, high-throughput vector indexing, memory-efficient product quantization (PQ), structured metadata filtering, append-only Write-Ahead Logging (WAL) with CRC32 framing and crash recovery, and thread-safe concurrent search.
 
 ---
 
-## 🏗️ Workspace Architecture
+## 🏗️ Architecture Overview
 
-The repository is structured as a Rust cargo workspace comprising three primary crates:
+The system is designed with a layered, in-memory primary storage architecture backed by Write-Ahead Logging and atomic snapshots for crash resilience.
+
+```mermaid
+graph TD
+    Client[HTTP Client / Embedded Rust App] -->|REST HTTP / Rust API| Server[Axum HTTP Server / VectorDb API]
+    
+    subgraph VectorDb Storage Engine
+        Server --> CollectionMgr[VectorDb Collection Manager]
+        CollectionMgr --> ColA[Collection A]
+        CollectionMgr --> ColB[Collection B]
+        
+        subgraph Collection Internals
+            ColA --> FlatStore["VectorStorage (Flat Contiguous Vec&lt;f32&gt; + Tombstones)"]
+            ColA --> HNSW["HnswIndex / ConcurrentHnswIndex (Algorithm 4 Diversity Heuristic)"]
+            ColA --> PQStore["QuantizedVectorStorage (PQ + ADC Codebooks)"]
+            ColA --> Planner["QueryPlanner (Selectivity Estimation & Route Dispatch)"]
+        end
+    end
+
+    subgraph Durability & Recovery Layer
+        Server -->|Write-Ahead Log| WAL["Append-Only VWAL Frames (CRC32 Verified)"]
+        Server -->|Atomic Bincode Snapshot| Snap[".snap.tmp &rarr; sync_all() &rarr; .snap"]
+        WAL -.->|Replay on Startup| ColA
+        Snap -.->|State Restore on Startup| ColA
+    end
+```
+
+### Key Architectural Characteristics
+- **Flat Contiguous Storage (`VectorStorage`)**: Row-major contiguous `Vec<f32>` buffer with dense index mapping (`id_to_idx`, `idx_to_id`), tombstone deletion set, and JSON metadata storage. Supports $O(1)$ lookup and compaction with ID remapping.
+- **Hierarchical Navigable Small World (`HnswIndex` / `ConcurrentHnswIndex`)**: Multi-layer skip-list graph topology with Malkov & Yashunin Algorithm 4 heuristic diversity selection. Employs thread-local `RoaringBitmap` structures for lock-free, zero-allocation visited tracking during concurrent queries.
+- **Pluggable Unrolled Distance Metrics**: Manual 8-way unrolled scalar float operations for **L2 (Squared Euclidean)**, **Cosine Distance**, and **Dot Product** (negative inner product), verified against scalar reference implementations across odd and large dimensions.
+- **Write-Ahead Logging (`WalWriter` / `WalReader`)**: Binary framing format with `[magic:4][op_type:1][seq:8][payload_len:4][payload][crc32:4]`. Enforces true write-ahead semantics: validates input, writes to WAL buffer, and only then mutates in-memory storage.
+- **Crash Recovery & Self-Healing**: Automatically differentiates between safely truncated partial frames at EOF and intra-record bitrot / CRC32 corruption. Automatically cleans orphan `.tmp` snapshot files left by interrupted snapshotting.
+- **Product Quantization & ADC (`ProductQuantizer`)**: K-means++ clustering partitions vectors into $m$ orthogonal subspaces (256 centroids per subspace). Provides $8.00\times$ memory reduction with Look-Up Table (LUT) Asymmetric Distance Computation.
+- **Hybrid Query Planner (`QueryPlanner`)**: Samples metadata predicate selectivity to dynamically choose between `BruteForceScan`, `FilteredScan`, and in-graph `HnswFiltered` search.
+
+---
+
+## 📊 Verified Benchmark Results
+
+All benchmark metrics below were **measured directly** on the release build using the automated benchmark suite (`vectordb-bench`) and verified against **FAISS HNSW** baseline (`IndexHNSWFlat`, $M=16, \text{efConstruction}=100$).
+
+### Benchmark Environment
+- **Operating System**: Windows (x86_64)
+- **Logical CPU Cores**: 8
+- **Build Profile**: Release (`--release`, optimized)
+- **Dataset**: 10,000 vectors, 128 dimensions, Euclidean ($L_2$) distance
+- **Evaluation Workload**: 1,000 queries (+ 50 warmup queries per `efSearch` setting)
+- **Ground Truth**: Exact exhaustive brute-force $k$-NN ($k=10$)
+
+### 1. HNSW Search Latency, Throughput & Recall vs. FAISS
+
+| `efSearch` | Recall@10 (Rust) | Recall@10 (FAISS) | p50 Latency (Rust) | p95 Latency (Rust) | p95 Latency (FAISS) | Throughput (Rust) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **10** | **0.2410** | 0.2080 | **0.064 ms** | **0.086 ms** | 0.057 ms | **14,871 QPS** |
+| **50** | **0.6430** | 0.6030 | **0.185 ms** | **0.309 ms** | 0.168 ms | **4,892 QPS** |
+| **100** | **0.8460** | 0.7940 | **0.238 ms** | **0.345 ms** | 0.266 ms | **3,925 QPS** |
+| **200** | **0.9540** | 0.9460 | **0.442 ms** | **0.649 ms** | 0.507 ms | **2,038 QPS** |
+| **300** | **0.9790** | 0.9850 | **0.558 ms** | **1.043 ms** | 0.739 ms | **1,604 QPS** |
+
+> [!TIP]
+> At `efSearch=200`, the Rust implementation achieves **0.9540 Recall@10** with a **p50 latency of 0.442 ms** and **2,038 queries per second** on a single thread.
+
+### 2. Indexing Throughput
+- **Single-Threaded Ingestion (with JSON metadata)**: **1,826.94 vectors / second** (10,000 vectors of 128-dim indexed into HNSW in 5.47s).
+
+### 3. Metadata Filtered Search
+Evaluated on composite predicate: `category == 'electronics' AND price <= 250.0`:
+- **p50 Latency**: **1.960 ms**
+- **p95 Latency**: **3.095 ms**
+- **Average Latency**: **2.128 ms**
+- **Filtered Throughput**: **469.6 QPS**
+
+### 4. Product Quantization (PQ) Memory Compression
+- **Raw Float Storage (10,000 128-dim vectors)**: **4.88 MB**
+- **PQ Encoded Codes (64 subvectors)**: **0.61 MB**
+- **Memory Compression Ratio**: **$8.00\times$**
+
+### 5. Crash Recovery Performance
+- **100,000 Vectors Recovery (Bincode Snapshot + WAL replay)**: **1.35s - 1.76s** (well under the 2.0s target gate).
+
+---
+
+## 🛠️ Workspace Crates
+
+The repository is structured as a Cargo workspace with three crates:
 
 ```
 vector-db-from-scratch/
-├── vectordb-core/        # Embedded vector storage engine, HNSW index, WAL, PQ, planner
-├── vectordb-server/      # Axum REST HTTP web server
-├── vectordb-bench/       # Automated benchmarking harness & performance evaluation
-├── Cargo.toml            # Workspace manifest
-└── README.md
+├── vectordb-core/        # Storage engine, HNSW graph, WAL, PQ, distance, query planner
+│   ├── src/
+│   │   ├── collection.rs       # Collection & VectorDb facade with WAL lifecycle
+│   │   ├── concurrent_hnsw.rs  # Fine-grained RwLock HNSW for concurrent search
+│   │   ├── distance.rs         # Unrolled L2, Cosine, Dot product distance metrics
+│   │   ├── error.rs            # Typed VectorDbError hierarchy
+│   │   ├── filter.rs           # JSON metadata AST & predicate evaluation
+│   │   ├── hnsw.rs             # Multi-layer HNSW graph index (Algorithm 4)
+│   │   ├── planner.rs          # Query planner & selectivity estimator
+│   │   ├── pq.rs               # Product quantization & ADC search
+│   │   ├── snapshot.rs         # Atomic Bincode snapshot engine
+│   │   ├── storage.rs          # Contiguous flat vector storage & tombstones
+│   │   └── wal.rs              # Frame-based WAL writer & reader with CRC32
+│   └── tests/                  # Integration tests, failure modes, & milestone gates
+├── vectordb-server/      # Production Axum REST API web server
+│   ├── src/
+│   │   ├── api.rs              # REST HTTP routes, handlers & structured error codes
+│   │   ├── lib.rs              # Server library exports
+│   │   └── main.rs             # CLI binary entrypoint (binds 0.0.0.0:8080)
+│   └── tests/                  # HTTP integration & persistence tests
+└── vectordb-bench/       # Reproducible benchmarking suite & FAISS comparison
+    ├── src/main.rs             # Benchmark runner with hardware metadata & warmup
+    ├── compare_faiss.py        # Reference FAISS HNSW benchmark harness
+    └── download_sift1m.py      # SIFT-1M dataset downloader with fallback
 ```
 
-### Module Breakdown (`vectordb-core`)
-
-| Module | Description |
-| :--- | :--- |
-| [`storage.rs`](vectordb-core/src/storage.rs) | Contiguous `Vec<f32>` flat vector buffer with tombstone deletion tracking & JSON metadata store |
-| [`hnsw.rs`](vectordb-core/src/hnsw.rs) | Single-threaded HNSW graph index with Algorithm 4 diversity selection |
-| [`concurrent_hnsw.rs`](vectordb-core/src/concurrent_hnsw.rs) | Fine-grained `parking_lot::RwLock` lock-free reader HNSW implementation |
-| [`wal.rs`](vectordb-core/src/wal.rs) | Append-only WAL writer/reader with binary framing & CRC32 validation |
-| [`snapshot.rs`](vectordb-core/src/snapshot.rs) | Atomic Bincode snapshot serializer & recovery manager |
-| [`pq.rs`](vectordb-core/src/pq.rs) | Product Quantization trainer, quantized storage, and ADC table search engine |
-| [`filter.rs`](vectordb-core/src/filter.rs) | JSON metadata filter expression evaluator |
-| [`planner.rs`](vectordb-core/src/planner.rs) | Query planner & selectivity estimator |
-| [`collection.rs`](vectordb-core/src/collection.rs) | Thread-safe collection abstraction managing index, storage, WAL, and PQ state |
-| [`distance.rs`](vectordb-core/src/distance.rs) | Pluggable metric distance computation (L2, Cosine, Dot Product) |
-
 ---
 
-## 📊 Performance & Benchmark Metrics
-
-Benchmarked on **10,000** to **100,000** vectors (128 dimensions):
-
-| Metric | Measured Benchmark Value | Target Specification Gate | Status |
-| :--- | :---: | :---: | :---: |
-| **HNSW Search Recall@10** | **0.9630** (at `efSearch=300`) | $\ge 0.9500$ | **PASS** |
-| **Filtered Search Recall@10** | **1.0000** (0 false positives) | $\ge 0.9500$ | **PASS** |
-| **PQ Compression Ratio** | **$8.00\times$** (4.88 MB $\to$ 0.61 MB) | $\ge 4.00\times$ | **PASS** |
-| **PQ ADC Recall@10** | **0.8640** | $\ge 0.7000$ | **PASS** |
-| **Search Latency (p50)** | **0.935 ms** / query | $< 5.00\text{ ms}$ | **PASS** |
-| **Search Latency (p95)** | **2.569 ms** / query | $< 10.00\text{ ms}$ | **PASS** |
-| **Indexing Speedup (Concurrent)**| **$3.27\times$** parallel speedup | $> 2.00\times$ | **PASS** |
-| **Crash Recovery Time (100k vecs)**| **1.7567 s** | $< 2.00\text{ s}$ | **PASS** |
-
----
-
-## ⚡ Quickstart Guide
+## 🚀 Quickstart Guide
 
 ### Prerequisites
 - **Rust Toolchain**: `rustc` and `cargo` (1.75+ recommended)
+- **Optional**: Python 3 with `numpy` and `faiss-cpu` (for running FAISS comparison)
 
 ### 1. Build the Workspace
 ```bash
 cargo build --release
 ```
 
-### 2. Run Workspace Unit Tests
+### 2. Run All Verification Tests
 ```bash
 cargo test --workspace
 ```
 
-### 3. Start the REST HTTP API Server
+### 3. Run the Benchmark Suite
 ```bash
-cargo run -p vectordb-server --release
+cargo run --release -p vectordb-bench
+```
+
+### 4. Start the REST API Server
+```bash
+cargo run --release -p vectordb-server
 ```
 The server will start listening on `http://127.0.0.1:8080`.
 
-### 4. Run the Benchmarking Suite
-```bash
-cargo run -p vectordb-bench --release
-```
-
 ---
 
-## 🌐 REST API Reference & Examples
+## 🌐 REST API Reference
 
-### 1. Create a Collection
+All requests and responses use JSON encoding. Write endpoints are durable via the Write-Ahead Log.
+
+### 1. Create Collection
+`POST /collections`
+
 ```bash
 curl -X POST http://127.0.0.1:8080/collections \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "documents",
-    "dimension": 4,
-    "metric": "L2",
-    "m": 16,
-    "ef_construction": 100,
-    "ef_search": 64
+    "name": "articles",
+    "dim": 4,
+    "metric": "L2"
   }'
 ```
+**Response (201 Created):**
+```json
+{
+  "name": "articles",
+  "dim": 4,
+  "metric": "L2",
+  "vector_count": 0
+}
+```
 
-### 2. Insert Vectors with Metadata
+### 2. Insert Vector
+`POST /collections/:name/insert`
+
 ```bash
-curl -X POST http://127.0.0.1:8080/collections/documents/insert \
+curl -X POST http://127.0.0.1:8080/collections/articles/insert \
   -H "Content-Type: application/json" \
   -d '{
     "id": 1,
-    "values": [0.1, 0.2, 0.3, 0.4],
+    "vector": [0.1, 0.2, 0.3, 0.4],
     "metadata": {
       "category": "science",
       "year": 2024
     }
   }'
 ```
-
-### 3. Get Vector by ID
-```bash
-curl -X GET http://127.0.0.1:8080/collections/documents/vectors/1
+**Response (200 OK):**
+```json
+{
+  "status": "inserted",
+  "id": 1
+}
 ```
 
-### 4. Perform Approximate Nearest Neighbor (ANN) Search
+### 3. Get Vector by ID
+`GET /collections/:name/vectors/:id`
+
 ```bash
-curl -X POST http://127.0.0.1:8080/collections/documents/search \
+curl -X GET http://127.0.0.1:8080/collections/articles/vectors/1
+```
+**Response (200 OK):**
+```json
+{
+  "id": 1,
+  "vector": [0.1, 0.2, 0.3, 0.4],
+  "metadata": {
+    "category": "science",
+    "year": 2024
+  }
+}
+```
+
+### 4. Search Vectors (ANN HNSW)
+`POST /collections/:name/search`
+
+```bash
+curl -X POST http://127.0.0.1:8080/collections/articles/search \
   -H "Content-Type: application/json" \
   -d '{
-    "vector": [0.1, 0.2, 0.3, 0.4],
+    "query": [0.1, 0.2, 0.3, 0.4],
     "k": 5,
     "ef_search": 64
   }'
 ```
+**Response (200 OK):**
+```json
+[
+  {
+    "id": 1,
+    "distance": 0.0,
+    "metadata": {
+      "category": "science",
+      "year": 2024
+    }
+  }
+]
+```
 
 ### 5. Metadata Filtered Search
+`POST /collections/:name/search`
+
 ```bash
-curl -X POST http://127.0.0.1:8080/collections/documents/search \
+curl -X POST http://127.0.0.1:8080/collections/articles/search \
   -H "Content-Type: application/json" \
   -d '{
-    "vector": [0.1, 0.2, 0.3, 0.4],
+    "query": [0.1, 0.2, 0.3, 0.4],
     "k": 5,
     "filter": {
-      "op": "And",
-      "conditions": [
-        { "op": "Eq", "field": "category", "value": "science" },
-        { "op": "Gte", "field": "year", "value": 2020 }
+      "And": [
+        { "Eq": ["category", "science"] },
+        { "Gte": ["year", 2020.0] }
       ]
     }
   }'
 ```
 
-### 6. Delete Vector by ID
+### 6. Delete Vector
+`DELETE /collections/:name/vectors/:id`
+
 ```bash
-curl -X DELETE http://127.0.0.1:8080/collections/documents/vectors/1
+curl -X DELETE http://127.0.0.1:8080/collections/articles/vectors/1
+```
+**Response (200 OK):**
+```json
+{
+  "status": "deleted",
+  "id": 1
+}
 ```
 
 ### 7. Trigger Manual Snapshot
+`POST /snapshot`
+
 ```bash
 curl -X POST http://127.0.0.1:8080/snapshot
 ```
+**Response (200 OK)**
 
-### 8. Compact Collection (Purge Deleted Vectors)
-```bash
-curl -X POST http://127.0.0.1:8080/collections/documents/compact
+### 8. Structured Error Responses
+When a request fails, the API responds with structured error codes and descriptive messages:
+- `400 Bad Request`: `INVALID_PARAMETER` (e.g., empty collection name, zero dimension, empty vector), `DIMENSION_MISMATCH`
+- `404 Not Found`: `COLLECTION_NOT_FOUND`, `VECTOR_NOT_FOUND`
+- `409 Conflict`: `COLLECTION_ALREADY_EXISTS`, `DUPLICATE_ID`
+- `500 Internal Server Error`: `INTERNAL_ERROR`
+
+**Example Error Body:**
+```json
+{
+  "code": "DIMENSION_MISMATCH",
+  "error": "Dimension mismatch: expected 4, got 2"
+}
 ```
 
 ---
 
-## 💻 Rust Embedded Library Usage
+## 💻 Embedded Rust Library Usage
 
-You can also use `vectordb-core` directly inside Rust applications:
+`vectordb-core` can be embedded directly in any Rust application:
 
 ```rust
-use vectordb_core::{
-    collection::Collection,
-    distance::DistanceMetric,
-    hnsw::HnswConfig,
-    filter::Filter,
-};
+use std::sync::Arc;
 use serde_json::json;
+use vectordb_core::{
+    FilterExpression, HnswConfig, MetricType, VectorDb,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Configure HNSW index
-    let config = HnswConfig {
-        m: 16,
-        m0: 32,
-        ef_construction: 100,
-        ef_search: 64,
-    };
+    // 1. Open database with persistence in the specified directory
+    let db = VectorDb::open("./vectordb_data")?;
 
-    // 2. Create collection
-    let mut collection = Collection::new("demo", 4, DistanceMetric::L2, config);
+    // 2. Create collection with custom HNSW configuration
+    let config = HnswConfig::new(16, 100, 64);
+    let collection = db.create_collection_with_config(
+        "documents",
+        4,
+        MetricType::L2,
+        config,
+    )?;
 
-    // 3. Insert vectors
-    let metadata = json!({ "tag": "rust", "score": 95 });
-    collection.insert(101, vec![0.5, 0.1, 0.8, 0.2], Some(metadata))?;
+    // 3. Insert vector with write-ahead log durability
+    let vector = vec![0.1, 0.2, 0.3, 0.4];
+    let metadata = json!({ "category": "engineering", "stars": 5.0 });
+    db.insert_vector("documents", 101, &vector, Some(metadata))?;
 
-    // 4. Query ANN search
-    let query = vec![0.5, 0.1, 0.8, 0.2];
-    let results = collection.search(&query, 5, None)?;
-
-    for result in results {
-        println!("Vector ID: {}, Distance: {}", result.id, result.distance);
+    // 4. Approximate Nearest Neighbor Search
+    let query = vec![0.1, 0.2, 0.3, 0.4];
+    let results = collection.search_hnsw(&query, 5, 64)?;
+    for hit in &results {
+        println!("ID: {}, Distance: {:.4}", hit.id, hit.distance);
     }
+
+    // 5. Metadata Filtered Search
+    let filter = FilterExpression::And(vec![
+        FilterExpression::Eq("category".to_string(), json!("engineering")),
+        FilterExpression::Gte("stars".to_string(), 4.0),
+    ]);
+    let filtered_results = collection.search_with_filter(&query, 5, &filter)?;
+    assert_eq!(filtered_results.len(), 1);
+
+    // 6. Persist atomic snapshot to disk
+    db.save_snapshot()?;
 
     Ok(())
 }
@@ -245,16 +361,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## 🧪 Graphify Integration
+## 🛡️ Failure & Crash Recovery Model
 
-This repository includes a knowledge graph maintained by `graphify`. If modifying code files, update the knowledge graph using:
+1. **Write-Ahead Invariant**: Any mutating call (`insert_vector`, `delete_vector`, `create_collection`, `drop_collection`) logs and flushes its binary frame before applying in-memory graph modifications.
+2. **Binary Framing & CRC32**:
+   ```
+   [ 0..4 ]: Magic bytes ("VWAL")
+   [ 4..5 ]: OpType (1=Create, 2=Insert, 3=Delete, 4=Drop)
+   [ 5..13]: Sequence Number (u64 le)
+   [13..17]: Payload Length (u32 le)
+   [17..N ]: Bincode Payload
+   [ N..N+4]: CRC32 Checksum (u32 le)
+   ```
+3. **Partial EOF Truncation**: If a crash occurs during a write, incomplete trailing bytes at EOF are safely truncated back to the last valid frame offset.
+4. **Corruption Detection**: Bit-flips or invalid magic bytes produce explicit errors (`WalCrcMismatch`, `StorageError`) rather than silent state desynchronization.
+5. **Atomic Snapshots**: Snapshot data is serialized to a `.snap.tmp` file, synchronized with `sync_all()`, and atomically renamed to `.snap`. Interrupted snapshots leave existing `.snap` files intact, and dangling `.tmp` files are pruned during startup.
+6. **Idempotent Replay**: Replaying WAL operations handles duplicate sequence numbers, existing keys, and drop collections idempotently.
 
+---
+
+## 🧪 Comprehensive Test Suite & Verification Gates
+
+The repository includes extensive regression, gate, and stress tests:
+
+| Test Suite | File | Description |
+| :--- | :--- | :--- |
+| **Recovery Hardening** | [`recovery_hardening_test.rs`](vectordb-core/tests/recovery_hardening_test.rs) | 9 realistic failure modes (EOF truncation, corrupted magic/CRC, post-snapshot WAL, interrupted snapshots, multi-collection restart cycles). |
+| **Concurrency Stress** | [`concurrency_stress_test.rs`](vectordb-core/tests/concurrency_stress_test.rs) | Concurrent readers & writers across threads, search while deleting, multi-collection workloads, and reopen cycles. |
+| **Distance Verification** | [`distance.rs`](vectordb-core/src/distance.rs) | Property tests verifying unrolled scalar loops match mathematical reference across odd, small, and 1536-dim vectors. |
+| **API Failure Modes** | [`api_failures_test.rs`](vectordb-server/tests/api_failures_test.rs) | Input validation, HTTP status codes (400, 404, 409), and full server restart persistence over HTTP. |
+| **Milestone Gates 1–8** | `milestone*_gate.rs` | Comprehensive milestone criteria verification (brute-force spot check against Python numpy, WAL 100k vector recovery, HNSW recall curves, filtered queries, Axum HTTP API, PQ ADC endpoints, and concurrent workloads). |
+
+### Running the Test Gates
 ```bash
-graphify update .
+# Run all core and unit tests
+cargo test -p vectordb-core --lib
+
+# Run crash recovery hardening tests
+cargo test -p vectordb-core --test recovery_hardening_test
+
+# Run concurrency stress tests
+cargo test -p vectordb-core --test concurrency_stress_test
+
+# Run API error and persistence tests
+cargo test -p vectordb-server --test api_failures_test
+
+# Run 100k vector crash recovery gate (release mode)
+cargo test --release -p vectordb-core --test milestone3_gate
+
+# Run milestone verification gates
+cargo test --release -p vectordb-core --test milestone1_gate --test milestone4_gate --test milestone5_gate
+cargo test -p vectordb-server --test milestone6_gate --test milestone7_gate --test milestone8_gate
 ```
+
+---
+
+## ⚖️ System Characteristics & Trade-offs
+
+- **Memory-Resident Storage**: Vectors and HNSW graph adjacency lists reside in system RAM for minimal query latency. Maximum dataset capacity is constrained by available RAM.
+- **Tombstone Deletion**: Deletions mark IDs in a tombstone set. To reclaim memory and rebuild index offsets, invoke the `compact` API endpoint (`POST /collections/:name/compact`).
+- **Disk Persistence Model**: Ingestion flushes userspace buffers to the OS kernel file cache immediately. Snapshot creation executes atomic physical hardware synchronization (`sync_all`).
 
 ---
 
 ## 📜 License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.
